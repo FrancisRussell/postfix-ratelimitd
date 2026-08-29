@@ -19,8 +19,20 @@ key_prefix = "postfix-ratelimitd:"
 password_file = "/etc/valkey/password"
 
 [server]
-# Unix socket Postfix's check_policy_service connects to.
-socket = "/var/spool/postfix/ratelimit/policy"
+# Unix socket Postfix's check_policy_service connects to. This path doesn't
+# depend on Postfix at all - it's created fresh on each start (e.g. via
+# systemd's RuntimeDirectory=). It works as an absolute path only if
+# Postfix's smtpd isn't chrooted - a chrooted smtpd can't see anything
+# outside its chroot (usually /var/spool/postfix), regardless of path.
+#
+# If your smtpd is chrooted (common on Debian/Ubuntu), put the socket under
+# the chroot instead, e.g.:
+#   socket = "/var/spool/postfix/postfix-ratelimitd/ratelimit.sock"
+# and reference it from master.cf as a path relative to Postfix's queue
+# directory rather than by absolute path: "unix:postfix-ratelimitd/ratelimit.sock".
+# A queue-relative reference resolves the same way whether or not smtpd is
+# chrooted, so it's a fine choice for this location either way.
+socket = "/run/postfix-ratelimitd/ratelimit.sock"
 
 # Action to take when a Valkey/Redis error prevents completing a check: "defer"
 # (fail closed, the default) or "permit" (fail open).
@@ -78,8 +90,12 @@ mechanism only applies to authenticated senders, so it has no place on the
 plain inbound `smtp` service:
 
 ```
--o smtpd_data_restrictions=check_policy_service { unix:ratelimit/policy, { default_action = defer_if_permit Service temporarily unavailable } }
+-o smtpd_data_restrictions=check_policy_service { unix:/run/postfix-ratelimitd/ratelimit.sock, { default_action = defer_if_permit Service temporarily unavailable } }
 ```
+
+(If `server.socket` points under `/var/spool/postfix` instead, as noted above,
+reference it here as a path relative to Postfix's queue directory rather than
+by absolute path - `unix:postfix-ratelimitd/ratelimit.sock`.)
 
 This **must** be wired into `smtpd_data_restrictions`, since only at the
 `DATA` stage has Postfix seen all recipients. If it's wired to any other

@@ -1,0 +1,82 @@
+[Unit]
+Description=Postfix recipient rate-limiting policy daemon
+After=network.target redis-server.service redis.service valkey.service
+Wants=redis-server.service redis.service valkey.service
+Before=postfix.service
+
+# Referencing all three Redis/Valkey unit names above is deliberate, not a
+# typo: systemd ignores an After=/Wants= naming a unit that doesn't exist on
+# this system, and the actual name varies - redis-server.service on
+# Debian/Ubuntu, plain redis.service on Fedora/RHEL/Arch, valkey.service
+# where Valkey is packaged separately (e.g. Ubuntu 26.04 instead ships Valkey
+# under the redis-server name). None of these directives do anything for a
+# Valkey/Redis instance that isn't local and systemd-managed - that case is
+# instead handled by this daemon's own bounded connection-retry logic at
+# startup.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/postfix-ratelimitd --config /etc/postfix-ratelimitd/config.toml --log-target syslog
+Restart=on-failure
+RestartSec=2
+
+# Runs as its own dedicated, unprivileged identity rather than as `postfix` -
+# a compromise of this daemon then can't inherit whatever wider privileges
+# Postfix itself has. DynamicUser=yes allocates that identity automatically,
+# so no `useradd` step is needed at install time.
+DynamicUser=yes
+
+# Creates /run/postfix-ratelimitd, owned by this service's dynamic user, mode
+# 0755 by default - matches the default `server.socket` path in the example
+# config. Postfix reaches the socket file inside it via that file's own
+# world-read-write permission (set by this daemon itself, not by directory
+# permissions - see main.rs's SOCKET_MODE), so no shared group membership
+# with Postfix is needed for this default location.
+RuntimeDirectory=postfix-ratelimitd
+RuntimeDirectoryMode=0755
+
+# If instead using the chrooted-Postfix alternative socket location documented
+# in the example config (somewhere under /var/spool/postfix), RuntimeDirectory=
+# can't help - that path isn't one systemd manages automatically. Replace
+# DynamicUser=yes and the RuntimeDirectory= lines above with a fixed identity
+# and an explicit directory-creation step instead, e.g.:
+#   User=postfix-ratelimitd
+#   Group=postfix-ratelimitd
+#   ExecStartPre=/usr/bin/install -d -m 2750 -o postfix-ratelimitd -g postfix /var/spool/postfix/postfix-ratelimitd
+# The setgid bit (the leading 2 in 2750) and postfix as the group make the
+# directory reachable by Postfix's own default group membership, without
+# adding this daemon to Postfix's group or Postfix to this daemon's group.
+
+# No capabilities, privileges, or filesystem access beyond what's needed to
+# read its config and create its own socket.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UMask=0027
+
+# Deliberately not PrivateNetwork=yes: Valkey/Redis may be reached over TCP or
+# TLS, not just a unix socket, and a hostname-based redis:// URL needs DNS
+# resolution too - PrivateNetwork=yes would sever all of that. This still
+# blocks address families this daemon has no legitimate use for.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
