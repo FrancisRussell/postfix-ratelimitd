@@ -22,6 +22,17 @@ password_file = "/etc/valkey/password"
 # Unix socket Postfix's check_policy_service connects to.
 socket = "/var/spool/postfix/ratelimit/policy"
 
+# Action to take when a Valkey/Redis error prevents completing a check: "defer"
+# (fail closed, the default) or "permit" (fail open).
+on_redis_error = "defer"
+
+# A request with no SASL username is always permitted - there's no identity to
+# rate-limit against - but by default it's also logged, since it usually means
+# smtpd_data_restrictions is applied somewhere it shouldn't be (see "Postfix
+# wiring" below). Set to false only if that's an intentional, known setup and
+# the warning is just noise.
+warn_on_unauthenticated = true
+
 # Non-default rules are evaluated top-to-bottom; the first match wins.
 # Exactly one `type = "default"` rule must be present, as the fallback when
 # nothing else matches - its position in the list doesn't matter. Each
@@ -71,7 +82,11 @@ plain inbound `smtp` service:
 ```
 
 This **must** be wired into `smtpd_data_restrictions`, since only at the
-`DATA` stage has Postfix seen all recipients.
+`DATA` stage has Postfix seen all recipients. If it's wired to any other
+restriction class instead, the daemon defers every request with "Rate limit
+service misconfigured" rather than risk enforcing limits against a wrong or
+partial recipient count, and logs an error naming the unexpected
+`protocol_state`.
 
 The nested `default_action` covers the case where Postfix can't reach the
 daemon's socket at all (it's down, or crashed); the daemon's own responses
@@ -117,12 +132,18 @@ stats interval_secs=60 accepted=1423 rejected=37 failed_deferred=1 failed_permit
 `accepted`/`rejected` count checks that passed or hit a configured limit;
 `failed_deferred`/`failed_permitted` count a Valkey/Redis error, split by
 which `on_redis_error` action it took; `invalid` counts a well-formed policy
-request missing `sasl_username`/`recipient_count`; `malformed` counts a
-request that failed to parse at all; `connections_rejected` counts hitting
-the concurrent-connection limit, distinct from `accept_errors` (the
-underlying `accept()` call itself failing, e.g. file descriptor exhaustion).
-Every field but `active_connections` is a count since the last line, reset
-to 0 once reported - `active_connections` is a live gauge, not a count.
+request with no SASL username, i.e. an unauthenticated connection reaching
+this daemon; `malformed` counts a request that failed to parse at all;
+`connections_rejected` counts hitting the concurrent-connection limit,
+distinct from `accept_errors` (the underlying `accept()` call itself
+failing, e.g. file descriptor exhaustion). Every field but
+`active_connections` is a count since the last line, reset to 0 once
+reported - `active_connections` is a live gauge, not a count.
+
+A wrong `protocol_state` or a missing `recipient_count` aren't in this line
+at all - see [Postfix wiring](#postfix-wiring); either means this daemon is
+wired to the wrong restriction class, which should never happen in a working
+deployment and is logged as an error immediately rather than tallied.
 
 ## License
 

@@ -12,6 +12,8 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use postfix_ratelimitd::{ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE};
+
 /// How long to wait for a spawned `valkey-server` or daemon to become ready.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -257,18 +259,13 @@ impl Daemon {
         Daemon { child, socket, _dir: dir }
     }
 
-    /// Sends one policy request and returns the response, up to and including
-    /// its blank-line terminator. Reads exactly one response rather than to
-    /// EOF, since the daemon (correctly) keeps the connection open for
-    /// further requests rather than closing it.
-    fn request(&self, sasl_username: &str, recipient_count: u32) -> String {
+    /// Sends one raw policy request (not necessarily well-formed) and returns
+    /// the response, up to and including its blank-line terminator. Reads
+    /// exactly one response rather than to EOF, since the daemon (correctly)
+    /// keeps the connection open for further requests rather than closing it.
+    fn raw_request(&self, request: &str) -> String {
         let stream = UnixStream::connect(&self.socket).expect("connect to daemon");
-        (&stream)
-            .write_all(
-                format!("sasl_username={sasl_username}\nrecipient_count={recipient_count}\nprotocol_state=DATA\n\n")
-                    .as_bytes(),
-            )
-            .expect("write request");
+        (&stream).write_all(request.as_bytes()).expect("write request");
 
         let mut reader = BufReader::new(&stream);
         let mut response = String::new();
@@ -281,6 +278,13 @@ impl Daemon {
                 return response;
             }
         }
+    }
+
+    /// Sends one well-formed `protocol_state=DATA` policy request.
+    fn request(&self, sasl_username: &str, recipient_count: u32) -> String {
+        self.raw_request(&format!(
+            "sasl_username={sasl_username}\nrecipient_count={recipient_count}\nprotocol_state=DATA\n\n"
+        ))
     }
 }
 
@@ -303,7 +307,7 @@ fn successful_check_writes_a_real_key() {
     );
 
     let response = daemon.request("alice", 3);
-    assert_eq!(response, "action=dunno\n\n");
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
     // A 1h window lands on a 128s bucket size (see `config::bucket_size`).
     let mut connection = valkey.connection();
@@ -311,6 +315,86 @@ fn successful_check_writes_a_real_key() {
         redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
     assert_eq!(fields.len(), 1, "expected exactly one recorded bucket");
     assert_eq!(fields[0].1, "3", "bucket value should be the recipient count");
+}
+
+#[test]
+fn wrong_protocol_state_defers_without_checking() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(
+        &valkey,
+        "redis.key_prefix = \"rl:\"\n\
+         [[limits]]\n\
+         type = \"default\"\n\
+         windows = [ { count = 50, duration = \"1h\" } ]\n",
+    );
+
+    // RCPT-stage requests are a sign this is wired to the wrong Postfix restriction
+    // class - deferred rather than checked, since recipient_count wouldn't yet
+    // be the message's final total.
+    let response = daemon.raw_request("sasl_username=alice\nrecipient_count=3\nprotocol_state=RCPT\n\n");
+    assert_eq!(response, format!("action={ACTION_MISCONFIGURED}\n\n"));
+
+    // Never reached the rate-limit check at all, so nothing should be recorded.
+    let mut connection = valkey.connection();
+    let fields: Vec<(String, String)> =
+        redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
+    assert!(fields.is_empty(), "a misconfigured-protocol-state request must not be recorded");
+}
+
+#[test]
+fn missing_recipient_count_defers_without_checking() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(
+        &valkey,
+        "redis.key_prefix = \"rl:\"\n\
+         [[limits]]\n\
+         type = \"default\"\n\
+         windows = [ { count = 50, duration = \"1h\" } ]\n",
+    );
+
+    // Same root cause as a wrong protocol_state - only smtpd_data_restrictions
+    // populates recipient_count.
+    let response = daemon.raw_request("sasl_username=alice\nprotocol_state=DATA\n\n");
+    assert_eq!(response, format!("action={ACTION_MISCONFIGURED}\n\n"));
+
+    let mut connection = valkey.connection();
+    let fields: Vec<(String, String)> =
+        redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
+    assert!(fields.is_empty(), "a misconfigured request must not be recorded");
+}
+
+#[test]
+fn unauthenticated_request_permitted_by_default() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(
+        &valkey,
+        "redis.key_prefix = \"rl:\"\n\
+         [[limits]]\n\
+         type = \"default\"\n\
+         windows = [ { count = 50, duration = \"1h\" } ]\n",
+    );
+
+    // No sasl_username at all - nothing to rate-limit against.
+    let response = daemon.raw_request("recipient_count=3\nprotocol_state=DATA\n\n");
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
+}
+
+#[test]
+fn unauthenticated_request_still_permitted_with_warning_silenced() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(
+        &valkey,
+        "redis.key_prefix = \"rl:\"\n\
+         server.warn_on_unauthenticated = false\n\
+         [[limits]]\n\
+         type = \"default\"\n\
+         windows = [ { count = 50, duration = \"1h\" } ]\n",
+    );
+
+    // warn_on_unauthenticated only silences the log line - it's still always
+    // permitted, since there's no identity to rate-limit against either way.
+    let response = daemon.raw_request("recipient_count=3\nprotocol_state=DATA\n\n");
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 }
 
 #[test]
@@ -328,7 +412,7 @@ fn redis_error_defers_by_default() {
     drop(valkey);
 
     let response = daemon.request("alice", 1);
-    assert_eq!(response, "action=defer_if_permit Service temporarily unavailable\n\n");
+    assert_eq!(response, format!("action={ACTION_SERVICE_UNAVAILABLE}\n\n"));
 }
 
 #[test]
@@ -346,7 +430,7 @@ fn redis_error_permits_when_configured() {
     drop(valkey);
 
     let response = daemon.request("alice", 1);
-    assert_eq!(response, "action=dunno\n\n");
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 }
 
 #[test]
@@ -361,7 +445,7 @@ fn successful_check_over_tcp() {
     );
 
     let response = daemon.request("alice", 3);
-    assert_eq!(response, "action=dunno\n\n");
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
     let mut connection = valkey.connection();
     let fields: Vec<(String, String)> =
@@ -382,11 +466,11 @@ fn rate_limit_exceeded_defers_and_does_not_record() {
 
     // Exactly at the limit: accepted and recorded.
     let response = daemon.request("alice", 2);
-    assert_eq!(response, "action=dunno\n\n");
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
     // One more recipient would push the window's total over its limit: rejected.
     let response = daemon.request("alice", 1);
-    assert_eq!(response, "action=defer_if_permit Recipient rate limit exceeded, retry later\n\n");
+    assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"));
 
     // The rejected message must not have been recorded alongside the accepted one.
     let mut connection = valkey.connection();
@@ -410,7 +494,7 @@ fn exceeding_either_window_defers_and_accepted_records_in_both() {
     // Fits the generous hourly window but exceeds the tight daily one: still
     // rejected.
     let response = daemon.request("alice", 3);
-    assert_eq!(response, "action=defer_if_permit Recipient rate limit exceeded, retry later\n\n");
+    assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"));
 
     // The 1h and 1d windows land on different bucket sizes (128s and 4096s
     // respectively, see `config::bucket_size`), so each has its own key.
@@ -424,7 +508,7 @@ fn exceeding_either_window_defers_and_accepted_records_in_both() {
 
     // Fits both windows: accepted and recorded in both.
     let response = daemon.request("alice", 2);
-    assert_eq!(response, "action=dunno\n\n");
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
     let hourly: Vec<(String, String)> =
         redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
@@ -460,7 +544,7 @@ fn expired_entries_stop_counting_against_the_limit() {
 
     // The stale entry must not count against the limit.
     let response = daemon.request("alice", 1);
-    assert_eq!(response, "action=dunno\n\n");
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
     // It must also have been pruned once touched, leaving only the new entry.
     let fields: Vec<String> = redis::cmd("HKEYS").arg("rl:alice:2").query(&mut connection).expect("hkeys");
@@ -482,7 +566,7 @@ fn tls_connection_to_valkey_with_custom_ca() {
     );
 
     let response = daemon.request("alice", 3);
-    assert_eq!(response, "action=dunno\n\n");
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
     // Confirms the check actually went through the TLS-only server, not a fallback.
     let mut connection = valkey.connection();

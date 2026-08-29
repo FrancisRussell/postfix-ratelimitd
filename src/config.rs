@@ -191,6 +191,10 @@ pub enum FailureAction {
 /// The default value of `on_redis_error` when the config file omits it.
 fn default_redis_error_action() -> FailureAction { FailureAction::Defer }
 
+/// The default value of `warn_on_unauthenticated` when the config file omits
+/// it.
+fn default_warn_on_unauthenticated() -> bool { true }
+
 /// The config file's `[redis]` section.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,6 +214,12 @@ struct RawServerConfig {
     socket: PathBuf,
     #[serde(default = "default_redis_error_action")]
     on_redis_error: FailureAction,
+    // Unauthenticated requests are always permitted (there's no SASL username to
+    // rate-limit against) - this only controls whether that's logged, for a
+    // deployment that intentionally shares a restriction class between
+    // authenticated and unauthenticated traffic and doesn't want the warning.
+    #[serde(default = "default_warn_on_unauthenticated")]
+    warn_on_unauthenticated: bool,
 }
 
 /// The config file's shape, before `limits` is validated and its regexes
@@ -228,6 +238,7 @@ pub struct Config {
     pub redis_connection_info: ConnectionInfo,
     pub redis_key_prefix: String,
     pub on_redis_error: FailureAction,
+    pub warn_on_unauthenticated: bool,
     pub socket: PathBuf,
     pub limits: Vec<LimitRule>,
     pub default_plan: CheckPlan,
@@ -324,6 +335,7 @@ impl Config {
             redis_connection_info,
             redis_key_prefix: raw.redis.key_prefix,
             on_redis_error: raw.server.on_redis_error,
+            warn_on_unauthenticated: raw.server.warn_on_unauthenticated,
             socket: raw.server.socket,
             limits,
             default_plan: default_plan.expect("default_count == 1 guarantees exactly one Default entry was seen"),
@@ -592,6 +604,18 @@ mod tests {
         );
         let config = load(&toml).expect("valid config");
         assert!(matches!(config.on_redis_error, FailureAction::Defer));
+    }
+
+    #[test]
+    fn warn_on_unauthenticated_defaults_to_true() {
+        let toml = format!(
+            "{BASE}\n\
+             [[limits]]\n\
+             type = \"default\"\n\
+             windows = [ {{ count = 1, duration = \"1h\" }} ]\n"
+        );
+        let config = load(&toml).expect("valid config");
+        assert!(config.warn_on_unauthenticated);
     }
 
     #[test]

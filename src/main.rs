@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 use clap::Parser;
 use config::{Config, FailureAction};
 use limiter::Limiter;
+use postfix_ratelimitd::{ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE};
 use protocol::{Request, write_action};
 use redis::ConnectionInfo;
 use tokio::io::BufReader;
@@ -57,10 +58,6 @@ struct Cli {
     #[arg(long)]
     syslog_ident: Option<String>,
 }
-
-const ACTION_DUNNO: &str = "dunno";
-const ACTION_SERVICE_UNAVAILABLE: &str = "defer_if_permit Service temporarily unavailable";
-const ACTION_RATE_LIMITED: &str = "defer_if_permit Recipient rate limit exceeded, retry later";
 
 /// Expected `protocol_state` for this daemon per its `smtpd_data_restrictions`
 /// wiring.
@@ -134,22 +131,33 @@ fn report_stats() {
 /// Decides the policy action to return for one request.
 async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -> &'static str {
     if request.protocol_state().is_some_and(|state| state != EXPECTED_PROTOCOL_STATE) {
-        log::warn!(
+        log::error!(
             "policy request at protocol_state {:?}, expected {EXPECTED_PROTOCOL_STATE:?} - check \
-             smtpd_data_restrictions wiring",
+             smtpd_data_restrictions wiring; deferring rather than risk enforcing limits against a wrong or \
+             partial recipient_count",
             request.protocol_state()
         );
+        return ACTION_MISCONFIGURED;
     }
 
     let Some(sasl_username) = request.sasl_username() else {
-        log::warn!("policy request has no SASL username - check this is wired to an authenticated service");
+        // Always permitted - there's no identity to rate-limit against - but logged
+        // (unless silenced) since it usually means smtpd_data_restrictions is
+        // wired somewhere it shouldn't be.
+        if config.warn_on_unauthenticated {
+            log::warn!("policy request has no SASL username - check this is wired to an authenticated service");
+        }
         STATS.invalid.fetch_add(1, Ordering::SeqCst);
         return ACTION_DUNNO;
     };
     let Some(recipient_count) = request.recipient_count() else {
-        log::warn!("policy request for {sasl_username} is missing recipient_count");
-        STATS.invalid.fetch_add(1, Ordering::SeqCst);
-        return ACTION_SERVICE_UNAVAILABLE;
+        // Same root cause as the protocol_state check above - smtpd_data_restrictions
+        // is the only restriction class that populates recipient_count, so a
+        // well-wired deployment never reaches this.
+        log::error!(
+            "policy request for {sasl_username} is missing recipient_count - check smtpd_data_restrictions wiring"
+        );
+        return ACTION_MISCONFIGURED;
     };
 
     let plan = config.plan_for(sasl_username);
