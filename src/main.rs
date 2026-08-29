@@ -84,13 +84,17 @@ const STATS_INTERVAL: Duration = Duration::from_secs(60);
 /// `report_stats`, which resets every field to 0 each time it reports them.
 /// `active_connections` isn't here since it's a live gauge, not something to
 /// accumulate - `report_stats` reads `ACTIVE_CONNECTIONS` directly instead.
+/// `misconfigured` isn't printed either - a wrong protocol_state or missing
+/// recipient_count should never happen in a working deployment, so it exists
+/// only to gate `log_throttled` for those two, not as a rate worth reporting.
 struct Stats {
     accepted: AtomicU64,
     rejected: AtomicU64,
     failed_deferred: AtomicU64,
     failed_permitted: AtomicU64,
-    invalid: AtomicU64,
+    unauthenticated: AtomicU64,
     malformed: AtomicU64,
+    misconfigured: AtomicU64,
     connections_accepted: AtomicU64,
     connections_rejected: AtomicU64,
     accept_errors: AtomicU64,
@@ -101,8 +105,9 @@ static STATS: Stats = Stats {
     rejected: AtomicU64::new(0),
     failed_deferred: AtomicU64::new(0),
     failed_permitted: AtomicU64::new(0),
-    invalid: AtomicU64::new(0),
+    unauthenticated: AtomicU64::new(0),
     malformed: AtomicU64::new(0),
+    misconfigured: AtomicU64::new(0),
     connections_accepted: AtomicU64::new(0),
     connections_rejected: AtomicU64::new(0),
     accept_errors: AtomicU64::new(0),
@@ -112,51 +117,85 @@ static STATS: Stats = Stats {
 /// then resets `STATS` back to 0 for the next interval.
 fn report_stats() {
     log::info!(
-        "stats interval_secs={} accepted={} rejected={} failed_deferred={} failed_permitted={} invalid={} \
+        "stats interval_secs={} accepted={} rejected={} failed_deferred={} failed_permitted={} unauthenticated={} \
          malformed={} connections_accepted={} connections_rejected={} accept_errors={} active_connections={}",
         STATS_INTERVAL.as_secs(),
         STATS.accepted.swap(0, Ordering::SeqCst),
         STATS.rejected.swap(0, Ordering::SeqCst),
         STATS.failed_deferred.swap(0, Ordering::SeqCst),
         STATS.failed_permitted.swap(0, Ordering::SeqCst),
-        STATS.invalid.swap(0, Ordering::SeqCst),
+        STATS.unauthenticated.swap(0, Ordering::SeqCst),
         STATS.malformed.swap(0, Ordering::SeqCst),
         STATS.connections_accepted.swap(0, Ordering::SeqCst),
         STATS.connections_rejected.swap(0, Ordering::SeqCst),
         STATS.accept_errors.swap(0, Ordering::SeqCst),
         ACTIVE_CONNECTIONS.load(Ordering::SeqCst),
     );
+    // Not printed (see Stats::misconfigured) - reset here anyway so log_throttled's
+    // suppression window still lines up with this same interval.
+    STATS.misconfigured.store(0, Ordering::SeqCst);
+}
+
+/// How many occurrences of a throttled condition (see `log_throttled`) are
+/// logged in full per stats interval before further ones are suppressed
+/// until the next report - enough to see a few real examples for diagnosis
+/// without flooding under sustained load.
+const LOG_SUPPRESSION_LIMIT: u64 = 5;
+
+/// Increments `counter` and calls `log_line` for its first
+/// `LOG_SUPPRESSION_LIMIT` occurrences since the last stats report (see
+/// `report_stats`, which resets every `STATS` field to 0), then logs one
+/// suppression notice naming `kind`, then stays quiet until the next report.
+/// `counter` itself keeps counting throughout regardless, so the periodic
+/// stats line always reflects the true total even while suppressed.
+fn log_throttled(counter: &AtomicU64, kind: &str, log_line: impl FnOnce()) {
+    let previous = counter.fetch_add(1, Ordering::SeqCst);
+    if previous < LOG_SUPPRESSION_LIMIT {
+        log_line();
+    } else if previous == LOG_SUPPRESSION_LIMIT {
+        log::warn!("suppressing further \"{kind}\" messages until the next stats report");
+    }
 }
 
 /// Decides the policy action to return for one request.
 async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -> &'static str {
     if request.protocol_state().is_some_and(|state| state != EXPECTED_PROTOCOL_STATE) {
-        log::error!(
-            "policy request at protocol_state {:?}, expected {EXPECTED_PROTOCOL_STATE:?} - check \
-             smtpd_data_restrictions wiring; deferring rather than risk enforcing limits against a wrong or \
-             partial recipient_count",
-            request.protocol_state()
-        );
+        log_throttled(&STATS.misconfigured, "smtpd_data_restrictions wiring", || {
+            log::error!(
+                "policy request at protocol_state {:?}, expected {EXPECTED_PROTOCOL_STATE:?} - check \
+                 smtpd_data_restrictions wiring; deferring rather than risk enforcing limits against a wrong or \
+                 partial recipient_count",
+                request.protocol_state()
+            );
+        });
         return ACTION_MISCONFIGURED;
     }
 
     let Some(sasl_username) = request.sasl_username() else {
         // Always permitted - there's no identity to rate-limit against - but logged
-        // (unless silenced) since it usually means smtpd_data_restrictions is
-        // wired somewhere it shouldn't be.
+        // (unless silenced via warn_on_unauthenticated) since it usually means
+        // smtpd_data_restrictions is wired somewhere it shouldn't be. The counter
+        // always increments either way, so the periodic stats line stays accurate
+        // even with warnings silenced or throttled.
         if config.warn_on_unauthenticated {
-            log::warn!("policy request has no SASL username - check this is wired to an authenticated service");
+            log_throttled(&STATS.unauthenticated, "unauthenticated request", || {
+                log::warn!("policy request has no SASL username - check this is wired to an authenticated service");
+            });
+        } else {
+            STATS.unauthenticated.fetch_add(1, Ordering::SeqCst);
         }
-        STATS.invalid.fetch_add(1, Ordering::SeqCst);
         return ACTION_DUNNO;
     };
     let Some(recipient_count) = request.recipient_count() else {
         // Same root cause as the protocol_state check above - smtpd_data_restrictions
         // is the only restriction class that populates recipient_count, so a
         // well-wired deployment never reaches this.
-        log::error!(
-            "policy request for {sasl_username} is missing recipient_count - check smtpd_data_restrictions wiring"
-        );
+        log_throttled(&STATS.misconfigured, "smtpd_data_restrictions wiring", || {
+            log::error!(
+                "policy request for {sasl_username} is missing recipient_count - check smtpd_data_restrictions \
+                 wiring"
+            );
+        });
         return ACTION_MISCONFIGURED;
     };
 
@@ -171,17 +210,16 @@ async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -
             ACTION_RATE_LIMITED
         }
         Err(err) => {
-            log::error!("valkey error checking rate limit for {sasl_username}: {err}");
-            match config.on_redis_error {
-                FailureAction::Defer => {
-                    STATS.failed_deferred.fetch_add(1, Ordering::SeqCst);
-                    ACTION_SERVICE_UNAVAILABLE
-                }
-                FailureAction::Permit => {
-                    STATS.failed_permitted.fetch_add(1, Ordering::SeqCst);
-                    ACTION_DUNNO
-                }
-            }
+            // A live Valkey outage would otherwise log this once per message for as long as
+            // it lasts, at full traffic volume - see log_throttled.
+            let (action, counter) = match config.on_redis_error {
+                FailureAction::Defer => (ACTION_SERVICE_UNAVAILABLE, &STATS.failed_deferred),
+                FailureAction::Permit => (ACTION_DUNNO, &STATS.failed_permitted),
+            };
+            log_throttled(counter, "valkey error checking rate limit", || {
+                log::error!("valkey error checking rate limit for {sasl_username}: {err}");
+            });
+            action
         }
     }
 }
@@ -456,8 +494,12 @@ async fn main() {
 
         if ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
-            log::warn!("rejecting connection: at the concurrent connection limit ({MAX_CONNECTIONS})");
-            STATS.connections_rejected.fetch_add(1, Ordering::SeqCst);
+            // This has no backoff of its own, unlike the accept() failure path below, so a
+            // sustained overload would otherwise log once per connection attempt for as
+            // long as it lasts - see log_throttled.
+            log_throttled(&STATS.connections_rejected, "concurrent connection limit rejection", || {
+                log::warn!("rejecting connection: at the concurrent connection limit ({MAX_CONNECTIONS})");
+            });
             continue;
         }
         STATS.connections_accepted.fetch_add(1, Ordering::SeqCst);
@@ -475,5 +517,25 @@ async fn main() {
     tracker.close();
     if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, tracker.wait()).await.is_err() {
         log::warn!("timed out waiting for in-flight connections to close during shutdown");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_throttled_calls_log_line_up_to_the_limit_then_suppresses() {
+        let counter = AtomicU64::new(0);
+        let mut calls = 0;
+        for _ in 0..LOG_SUPPRESSION_LIMIT * 2 {
+            log_throttled(&counter, "test", || calls += 1);
+        }
+        assert_eq!(calls, LOG_SUPPRESSION_LIMIT, "log_line should fire exactly LOG_SUPPRESSION_LIMIT times");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            LOG_SUPPRESSION_LIMIT * 2,
+            "the counter must keep counting even while suppressed"
+        );
     }
 }

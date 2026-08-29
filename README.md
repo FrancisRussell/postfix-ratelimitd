@@ -126,14 +126,15 @@ same as native journal capture) or a standalone rsyslog/syslog-ng.
 Every 60s, an INFO line summarizes activity since the last one:
 
 ```
-stats interval_secs=60 accepted=1423 rejected=37 failed_deferred=1 failed_permitted=0 invalid=0 malformed=0 connections_accepted=12 connections_rejected=0 accept_errors=0 active_connections=8
+stats interval_secs=60 accepted=1423 rejected=37 failed_deferred=1 failed_permitted=0 unauthenticated=0 malformed=0 connections_accepted=12 connections_rejected=0 accept_errors=0 active_connections=8
 ```
 
 `accepted`/`rejected` count checks that passed or hit a configured limit;
 `failed_deferred`/`failed_permitted` count a Valkey/Redis error, split by
-which `on_redis_error` action it took; `invalid` counts a well-formed policy
-request with no SASL username, i.e. an unauthenticated connection reaching
-this daemon; `malformed` counts a request that failed to parse at all;
+which `on_redis_error` action it took; `unauthenticated` counts a well-formed
+policy request with no SASL username reaching this daemon (see
+`warn_on_unauthenticated` above); `malformed` counts a request that failed to
+parse at all;
 `connections_rejected` counts hitting the concurrent-connection limit,
 distinct from `accept_errors` (the underlying `accept()` call itself
 failing, e.g. file descriptor exhaustion). Every field but
