@@ -1,0 +1,8 @@
+/target
+/tags
+tags.lock
+tags.temp
+.vscode/
+.idea/
+*.swp
+.DS_Store
