@@ -38,13 +38,10 @@ impl Limiter {
     pub async fn new(connection_info: ConnectionInfo, key_prefix: String) -> redis::RedisResult<Limiter> {
         let client = Client::open(connection_info)?;
         let manager_config = ConnectionManagerConfig::new()
-            .set_connection_timeout(CONNECTION_TIMEOUT)
-            .set_response_timeout(RESPONSE_TIMEOUT)
+            .set_connection_timeout(Some(CONNECTION_TIMEOUT))
+            .set_response_timeout(Some(RESPONSE_TIMEOUT))
             .set_number_of_retries(CONNECTION_RETRIES)
-            .set_max_delay(
-                u64::try_from(CONNECTION_RETRY_MAX_DELAY.as_millis())
-                    .expect("CONNECTION_RETRY_MAX_DELAY is a small constant, far under u64::MAX millis"),
-            );
+            .set_max_delay(CONNECTION_RETRY_MAX_DELAY);
         let connection_manager = client.get_connection_manager_with_config(manager_config).await?;
         Ok(Limiter { connection_manager, key_prefix, script: Script::new(CHECK_AND_RECORD) })
     }

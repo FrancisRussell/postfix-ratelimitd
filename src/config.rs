@@ -297,15 +297,16 @@ impl Config {
 
         let mut redis_connection_info =
             raw.redis.url.as_str().into_connection_info().map_err(|source| ConfigError::BadRedisUrl { source })?;
-        redis_connection_info.redis.db = raw.redis.db;
+        let mut redis_settings = redis_connection_info.redis_settings().clone().set_db(raw.redis.db);
         if let Some(path) = raw.redis.password_file {
-            if redis_connection_info.redis.password.is_some() {
+            if redis_settings.password().is_some() {
                 return Err(ConfigError::AmbiguousPassword);
             }
             let password =
                 std::fs::read_to_string(&path).map_err(|source| ConfigError::ReadPasswordFile { path, source })?;
-            redis_connection_info.redis.password = Some(password.trim_end().to_string());
+            redis_settings = redis_settings.set_password(password.trim_end());
         }
+        redis_connection_info = redis_connection_info.set_redis_settings(redis_settings);
 
         let default_count = raw.limits.iter().filter(|rule| matches!(rule, RawLimitRule::Default { .. })).count();
         if default_count != 1 {
@@ -577,7 +578,7 @@ mod tests {
                      type = \"default\"\n\
                      windows = [ { count = 1, duration = \"1h\" } ]\n";
         let config = load(toml).expect("valid config with url-embedded password");
-        assert_eq!(config.redis_connection_info.redis.password.as_deref(), Some("embedded-pw"));
+        assert_eq!(config.redis_connection_info.redis_settings().password(), Some("embedded-pw"));
     }
 
     #[test]
@@ -592,7 +593,7 @@ mod tests {
             password_file.path().display()
         );
         let config = load(&toml).expect("valid config with password file");
-        assert_eq!(config.redis_connection_info.redis.password.as_deref(), Some("file-pw"));
+        assert_eq!(config.redis_connection_info.redis_settings().password(), Some("file-pw"));
     }
 
     #[test]

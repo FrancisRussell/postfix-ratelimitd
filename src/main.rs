@@ -338,11 +338,12 @@ async fn shutdown_requested() {
 /// Whether `a` and `b` would make [`Limiter::new`] connect to the same place
 /// with the same credentials.
 fn same_redis_connection(a: &ConnectionInfo, b: &ConnectionInfo) -> bool {
-    a.addr == b.addr
-        && a.redis.db == b.redis.db
-        && a.redis.username == b.redis.username
-        && a.redis.password == b.redis.password
-        && a.redis.protocol == b.redis.protocol
+    let (a_redis, b_redis) = (a.redis_settings(), b.redis_settings());
+    a.addr() == b.addr()
+        && a_redis.db() == b_redis.db()
+        && a_redis.username() == b_redis.username()
+        && a_redis.password() == b_redis.password()
+        && a_redis.protocol() == b_redis.protocol()
 }
 
 /// Handles one SIGHUP: reloads `path` and swaps it into `config`/`limiter` if
