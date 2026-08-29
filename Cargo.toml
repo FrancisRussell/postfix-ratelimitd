@@ -17,7 +17,7 @@ humantime-serde = "1"
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 syslog = "7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # The rustls ring feature is needed to provide a crypto backend.
