@@ -114,7 +114,7 @@ pub struct PlannedWindow {
 /// The `bucket_sizes`/`retention_secs`/`windows` fields of a [`CheckPlan`],
 /// factored out only so `CheckPlan::new` has something to serialize that
 /// excludes its cached `json` field.
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct CheckPlanFields<'a> {
     bucket_sizes: &'a [u64],
     retention_secs: &'a [u64],
@@ -146,6 +146,7 @@ pub struct CheckPlan {
 }
 
 impl CheckPlan {
+    /// Builds a plan from a rule's windows - see the `CheckPlan` docs above.
     fn new(windows: &[Window]) -> CheckPlan {
         let mut bucket_sizes: Vec<u64> = Vec::new();
         let mut retention_secs: Vec<u64> = Vec::new();

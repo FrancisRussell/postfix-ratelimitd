@@ -87,6 +87,7 @@ const STATS_INTERVAL: Duration = Duration::from_secs(60);
 /// `misconfigured` isn't printed either - a wrong protocol_state or missing
 /// recipient_count should never happen in a working deployment, so it exists
 /// only to gate `log_throttled` for those two, not as a rate worth reporting.
+#[derive(Debug)]
 struct Stats {
     accepted: AtomicU64,
     rejected: AtomicU64,
@@ -300,7 +301,7 @@ fn init_logging(target: LogTarget, syslog_ident: Option<&str>) {
                 facility: syslog::Facility::LOG_DAEMON,
                 hostname: None,
                 process: ident,
-                pid: 0,
+                pid: 0, // the syslog crate's convention for "fill in the real process ID"
             };
             match syslog::unix(formatter) {
                 Ok(logger) => {

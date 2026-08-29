@@ -41,7 +41,10 @@ impl Limiter {
             .set_connection_timeout(CONNECTION_TIMEOUT)
             .set_response_timeout(RESPONSE_TIMEOUT)
             .set_number_of_retries(CONNECTION_RETRIES)
-            .set_max_delay(CONNECTION_RETRY_MAX_DELAY.as_millis() as u64);
+            .set_max_delay(
+                u64::try_from(CONNECTION_RETRY_MAX_DELAY.as_millis())
+                    .expect("CONNECTION_RETRY_MAX_DELAY is a small constant, far under u64::MAX millis"),
+            );
         let connection_manager = client.get_connection_manager_with_config(manager_config).await?;
         Ok(Limiter { connection_manager, key_prefix, script: Script::new(CHECK_AND_RECORD) })
     }

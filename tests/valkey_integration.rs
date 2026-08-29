@@ -21,6 +21,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How a [`ValkeyInstance`] can be reached.
+#[derive(Debug, Clone)]
 enum Transport {
     Unix {
         socket: std::path::PathBuf,
@@ -40,6 +41,7 @@ enum Transport {
 
 /// A throwaway `valkey-server` instance, reachable only via `transport`, in its
 /// own tempdir.
+#[derive(Debug)]
 struct ValkeyInstance {
     child: Child,
     transport: Transport,
@@ -209,6 +211,7 @@ impl Drop for ValkeyInstance {
 }
 
 /// A running daemon instance and its temp config/socket, cleaned up on drop.
+#[derive(Debug)]
 struct Daemon {
     child: Child,
     socket: std::path::PathBuf,
