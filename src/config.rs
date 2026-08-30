@@ -112,13 +112,13 @@ pub struct PlannedWindow {
 }
 
 /// The `bucket_sizes`/`retention_secs`/`windows` fields of a [`CheckPlan`],
-/// factored out only so `CheckPlan::new` has something to serialize that
-/// excludes its cached `json` field.
+/// factored out so `Limiter::check` can nest them into a request without
+/// duplicating the fields making it up.
 #[derive(Debug, Clone, Serialize)]
-struct CheckPlanFields<'a> {
-    bucket_sizes: &'a [u64],
-    retention_secs: &'a [u64],
-    windows: &'a [PlannedWindow],
+pub(crate) struct CheckPlanFields<'a> {
+    pub(crate) bucket_sizes: &'a [u64],
+    pub(crate) retention_secs: &'a [u64],
+    pub(crate) windows: &'a [PlannedWindow],
 }
 
 /// The precomputed shape of a `check_and_record.lua` invocation for a set of
@@ -130,19 +130,13 @@ struct CheckPlanFields<'a> {
 #[derive(Debug, Clone)]
 pub struct CheckPlan {
     pub bucket_sizes: Vec<u64>,
-    // Only read directly by this module's own tests; `Limiter::check` sends
-    // `json` instead, since production code never needs anything but the
-    // already-serialized form.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub windows: Vec<PlannedWindow>,
     // The longest span (in seconds) any window sharing bucket_sizes[i] needs
     // retained - the widest of their spans, since a key must keep history for
     // whichever sharing window needs the most. check_and_record.lua uses this
     // directly for that key's EXPIRE and prune cutoff, rather than
     // re-deriving it from `windows` on every check.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub retention_secs: Vec<u64>,
-    json: String,
 }
 
 impl CheckPlan {
@@ -165,18 +159,18 @@ impl CheckPlan {
             retention_secs[key_index] = retention_secs[key_index].max(span_secs);
             planned_windows.push(PlannedWindow { key_index, span_secs, limit: window.count });
         }
-        let json = serde_json::to_string(&CheckPlanFields {
-            bucket_sizes: &bucket_sizes,
-            retention_secs: &retention_secs,
-            windows: &planned_windows,
-        })
-        .expect("CheckPlan contains no types that can fail to serialize");
-        CheckPlan { bucket_sizes, windows: planned_windows, retention_secs, json }
+        CheckPlan { bucket_sizes, windows: planned_windows, retention_secs }
     }
 
-    /// This plan's `bucket_sizes`/`windows`, pre-serialized as JSON once at
-    /// construction rather than on every check - see `Limiter::check`.
-    pub fn json(&self) -> &str { &self.json }
+    /// Borrows this plan's fields for nesting into a `Limiter::check` request
+    /// - cheap, since it's just references, not a serialization.
+    pub(crate) fn fields(&self) -> CheckPlanFields<'_> {
+        CheckPlanFields {
+            bucket_sizes: &self.bucket_sizes,
+            retention_secs: &self.retention_secs,
+            windows: &self.windows,
+        }
+    }
 }
 
 /// A Postfix action to take when a check can't be completed.

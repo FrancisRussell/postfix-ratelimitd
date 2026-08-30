@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{Client, ConnectionInfo, Script};
+use serde::Serialize;
 
-use crate::config::CheckPlan;
+use crate::config::{CheckPlan, CheckPlanFields};
 
 const CHECK_AND_RECORD: &str = include_str!("../lua/check_and_record.lua");
 
@@ -28,6 +29,22 @@ const CONNECTION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 /// exercise weeks- or months-long windows without real time passing. Not a
 /// documented config option; never set outside tests.
 const FAKE_NOW_ENV_VAR: &str = "POSTFIX_RATELIMITD_FAKE_NOW";
+
+/// One `check_and_record.lua` invocation's arguments, sent as a single JSON
+/// value rather than flattened into positional arguments, so the two sides
+/// can't silently drift out of step on argument order or count.
+#[derive(Serialize)]
+struct CheckRequest<'a> {
+    recipient_count: u32,
+    // Omitted entirely rather than sent as JSON `null` when absent: cjson
+    // decodes a JSON `null` to the sentinel `cjson.null`, not Lua's `nil` -
+    // which is truthy, so the script's `if request.fake_now then` check would
+    // misfire on every request if this were serialized as `null` instead of
+    // left out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fake_now: Option<u64>,
+    plan: CheckPlanFields<'a>,
+}
 
 /// Checks and records recipient counts against Valkey via
 /// `check_and_record.lua`.
@@ -60,11 +77,10 @@ impl Limiter {
     /// Windows are aggregated into time buckets (see `check_and_record.lua`),
     /// and windows whose durations land on the same bucket size share a key,
     /// so a message updates each distinct key once, however many windows
-    /// reference it. `plan` is precomputed once per config load/reload (see
-    /// `config::CheckPlan`), since it depends only on window durations, never
-    /// on a request. It's passed to the script as JSON rather than flattened
-    /// into positional arguments, so the two sides can't silently drift out
-    /// of step on argument order or count.
+    /// reference it. `plan`'s bucket sizes and spans depend only on window
+    /// durations, never on a request, but re-serializing them alongside
+    /// `recipient_count` on every check is cheap enough not to be worth
+    /// caching separately.
     pub async fn check(&self, sasl_username: &str, recipient_count: u32, plan: &CheckPlan) -> redis::RedisResult<bool> {
         let mut connection = self.connection_manager.clone();
         let mut invocation = self.script.prepare_invoke();
@@ -73,10 +89,10 @@ impl Limiter {
             invocation.key(format!("{}{}:{}", self.key_prefix, sasl_username, bucket_size));
         }
 
-        invocation.arg(recipient_count).arg(plan.json());
-        if let Some(fake_now) = self.fake_now {
-            invocation.arg(fake_now);
-        }
+        let request = CheckRequest { recipient_count, fake_now: self.fake_now, plan: plan.fields() };
+        let request =
+            serde_json::to_string(&request).expect("CheckRequest contains no types that can fail to serialize");
+        invocation.arg(request);
 
         let allowed: i64 = invocation.invoke_async(&mut connection).await?;
         Ok(allowed == 1)

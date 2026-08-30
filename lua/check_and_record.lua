@@ -4,38 +4,34 @@
 -- that key's bucket size); its value is the accumulated recipient count
 -- recorded in that bucket.
 --
--- ARGV[1]: recipient count for this message.
--- ARGV[2]: JSON-encoded plan (see config::CheckPlan), sent as one value
--- rather than flattened into positional arguments so field names travel with
--- the data instead of relying on this script and limiter.rs agreeing on an
--- implicit argument order:
---   bucket_sizes: each KEYS[i]'s bucket size in seconds, parallel to KEYS.
---   retention_secs: how long KEYS[i] must retain buckets, parallel to KEYS -
---     the longest span of any window sharing that key, since a key must keep
---     history for whichever sharing window needs the most. Used as both that
---     key's EXPIRE and its prune cutoff.
---   windows: one { key_index, span_secs, limit } object per configured
---     window. key_index arrives 0-based (matching bucket_sizes/limiter.rs);
---     this script switches it to 1-based right after decoding, below.
---     span_secs is the window's duration rounded up to a whole number of
---     buckets (computed once from config, not here, since it doesn't depend
---     on anything in KEYS).
--- ARGV[3]: optional; a fixed unix timestamp to use as "now" instead of
--- calling TIME, for tests that need to exercise weeks- or months-long
--- windows without real time passing (see limiter.rs's fake_now). Never sent
--- outside tests.
+-- ARGV[1]: JSON-encoded request (see limiter.rs's CheckRequest), sent as one
+-- value rather than flattened into positional arguments so field names
+-- travel with the data instead of relying on this script and limiter.rs
+-- agreeing on an implicit argument order:
+--   recipient_count: recipient count for this message.
+--   fake_now: optional; a fixed unix timestamp to use as "now" instead of
+--     calling TIME, for tests that need to exercise weeks- or months-long
+--     windows without real time passing. Never sent outside tests.
+--   plan: this check's precomputed bucket sizes and windows -
+--     bucket_sizes: each KEYS[i]'s bucket size in seconds, parallel to KEYS.
+--     retention_secs: how long KEYS[i] must retain buckets, parallel to
+--       KEYS - the longest span of any window sharing that key, since a key
+--       must keep history for whichever sharing window needs the most. Used
+--       as both that key's EXPIRE and its prune cutoff.
+--     windows: one { key_index, span_secs, limit } object per configured
+--       window. key_index arrives 0-based (matching bucket_sizes/limiter.rs);
+--       this script switches it to 1-based right after decoding, below.
+--       span_secs is the window's duration rounded up to a whole number of
+--       buckets (computed once from config, not here, since it doesn't
+--       depend on anything in KEYS).
 
-local now
-if ARGV[3] then
-    now = tonumber(ARGV[3])
-else
-    now = tonumber(redis.call('TIME')[1])
-end
-
-local recipient_count = tonumber(ARGV[1])
-local plan = cjson.decode(ARGV[2])
+local request = cjson.decode(ARGV[1])
+local recipient_count = request.recipient_count
+local plan = request.plan
 local bucket_sizes = plan.bucket_sizes
 local num_keys = #bucket_sizes
+
+local now = request.fake_now or tonumber(redis.call('TIME')[1])
 
 -- plan.windows' key_index is 0-based (matching bucket_sizes/limiter.rs);
 -- switch it to 1-based here, once, rather than adding 1 at every use below.
