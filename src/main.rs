@@ -1,7 +1,3 @@
-mod config;
-mod limiter;
-mod protocol;
-
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,10 +6,10 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use clap::Parser;
-use config::{Config, FailureAction};
-use limiter::Limiter;
+use postfix_ratelimitd::config::{Config, FailureAction};
+use postfix_ratelimitd::limiter::Limiter;
+use postfix_ratelimitd::protocol::{Request, write_action};
 use postfix_ratelimitd::{ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE};
-use protocol::{Request, write_action};
 use redis::ConnectionInfo;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};

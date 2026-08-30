@@ -67,7 +67,7 @@ const MAX_WINDOW_DURATION: Duration = Duration::from_hours(31 * 24);
 /// doesn't need clamping to `MIN_BUCKET_SIZE` or `MAX_BUCKET_SIZE` - giving a
 /// target overcount of `1/BUCKET_TARGET_COUNT` (5%) of the window's own
 /// duration.
-const BUCKET_TARGET_COUNT: u64 = 20;
+pub const BUCKET_TARGET_COUNT: u64 = 20;
 
 /// The smallest bucket size ever used, regardless of what
 /// `BUCKET_TARGET_COUNT` would otherwise compute for a very short window.
