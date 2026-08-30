@@ -729,6 +729,56 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
 }
 
 #[test]
+fn multi_window_rule_ages_out_each_window_independently() {
+    let valkey = ValkeyInstance::start_unix();
+    // The README's own example rule: a tight hourly cap and a much looser
+    // daily one. 1h and 1d land on different bucket sizes, so - unlike
+    // a_shorter_window_stops_counting_before_its_shared_key_is_pruned's shared
+    // key - each window keeps its own key and ages out fully independently.
+    // The daily cap (21) is deliberately tight, not generous like the hourly
+    // one - see the last stage below, which depends on it.
+    let config = "redis.key_prefix = \"rl:\"\n\
+                  [[limits]]\n\
+                  type = \"default\"\n\
+                  windows = [ { count = 20, duration = \"1h\" }, { count = 21, duration = \"1d\" } ]\n";
+    let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
+
+    // Fills the hourly cap exactly, and puts the daily one at 20/21.
+    let now = base_now.to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
+    let response = daemon.request("alice", 20);
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "first message should fit both empty windows");
+
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"), "the hourly cap should already be full");
+    drop(daemon);
+
+    // 2 hours later: past the hourly window's own span (~62 minutes), but
+    // nowhere near the daily window's (~25 hours) - the hourly window should
+    // have reset while the daily total (still counting the 2-hour-old
+    // message) is exactly full at 21/21.
+    let two_hours_later = (base_now + 2 * 60 * 60).to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", two_hours_later.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(
+        response,
+        format!("action={ACTION_DUNNO}\n\n"),
+        "the hourly window should have reset, even though the daily one hasn't"
+    );
+
+    // One more message, still at the same instant: the hourly window (now at
+    // 1/20) has plenty of room, but the daily one is exactly full. This only
+    // rejects if the 2-hour-old message is still correctly counted against
+    // the daily window's own (much longer) span - if a bug used the hourly
+    // window's shorter span for both (a real mistake this guards against:
+    // reusing one window's cutoff for another), the daily window would
+    // wrongly see only the last two messages and accept this one too.
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", two_hours_later.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"), "the daily cap should already be exactly full");
+}
+
+#[test]
 fn tls_connection_to_valkey_with_custom_ca() {
     let valkey = ValkeyInstance::start_tls();
     let ca_cert = valkey.tls_ca_cert().to_str().expect("fixture CA path is valid UTF-8");
