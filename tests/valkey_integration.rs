@@ -201,6 +201,16 @@ impl ValkeyInstance {
         let now: u64 = time[0].parse().expect("TIME seconds");
         now / bucket_size_secs
     }
+
+    /// Keys matching `pattern` right now. Tests use this instead of a
+    /// hardcoded key name (which encodes a bucket size this daemon computed,
+    /// not one the test chose) so a change to that computation makes the
+    /// assertion fail loudly rather than silently checking the wrong - or an
+    /// always-empty - key and passing anyway.
+    fn keys(&self, pattern: &str) -> Vec<String> {
+        let mut connection = self.connection();
+        redis::cmd("KEYS").arg(pattern).query(&mut connection).expect("keys")
+    }
 }
 
 impl Drop for ValkeyInstance {
@@ -312,10 +322,10 @@ fn successful_check_writes_a_real_key() {
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
-    // A 1h window lands on a 128s bucket size (see `config::bucket_size`).
+    let keys = valkey.keys("rl:alice:*");
+    assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
-    let fields: Vec<(String, String)> =
-        redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
+    let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
     assert_eq!(fields.len(), 1, "expected exactly one recorded bucket");
     assert_eq!(fields[0].1, "3", "bucket value should be the recipient count");
 }
@@ -337,11 +347,9 @@ fn wrong_protocol_state_defers_without_checking() {
     let response = daemon.raw_request("sasl_username=alice\nrecipient_count=3\nprotocol_state=RCPT\n\n");
     assert_eq!(response, format!("action={ACTION_MISCONFIGURED}\n\n"));
 
-    // Never reached the rate-limit check at all, so nothing should be recorded.
-    let mut connection = valkey.connection();
-    let fields: Vec<(String, String)> =
-        redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
-    assert!(fields.is_empty(), "a misconfigured-protocol-state request must not be recorded");
+    // Never reached the rate-limit check at all, so nothing should be recorded -
+    // under any key, not just the one this window's own bucket size would use.
+    assert!(valkey.keys("rl:alice:*").is_empty(), "a misconfigured-protocol-state request must not be recorded");
 }
 
 #[test]
@@ -360,10 +368,7 @@ fn missing_recipient_count_defers_without_checking() {
     let response = daemon.raw_request("sasl_username=alice\nprotocol_state=DATA\n\n");
     assert_eq!(response, format!("action={ACTION_MISCONFIGURED}\n\n"));
 
-    let mut connection = valkey.connection();
-    let fields: Vec<(String, String)> =
-        redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
-    assert!(fields.is_empty(), "a misconfigured request must not be recorded");
+    assert!(valkey.keys("rl:alice:*").is_empty(), "a misconfigured request must not be recorded");
 }
 
 #[test]
@@ -450,9 +455,10 @@ fn successful_check_over_tcp() {
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
+    let keys = valkey.keys("rl:alice:*");
+    assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
-    let fields: Vec<(String, String)> =
-        redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
+    let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
     assert_eq!(fields.len(), 1, "expected exactly one recorded bucket");
 }
 
@@ -476,9 +482,10 @@ fn rate_limit_exceeded_defers_and_does_not_record() {
     assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"));
 
     // The rejected message must not have been recorded alongside the accepted one.
+    let keys = valkey.keys("rl:alice:*");
+    assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
-    let fields: Vec<(String, String)> =
-        redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
+    let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
     assert_eq!(fields.len(), 1, "rejected message must not be recorded");
     assert_eq!(fields[0].1, "2", "recorded bucket should still reflect only the accepted message");
 }
@@ -498,27 +505,22 @@ fn exceeding_either_window_defers_and_accepted_records_in_both() {
     // rejected.
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"));
+    assert!(valkey.keys("rl:alice:*").is_empty(), "rejected message must not be recorded in any window");
 
-    // The 1h and 1d windows land on different bucket sizes (128s and 4096s
-    // respectively, see `config::bucket_size`), so each has its own key.
-    let mut connection = valkey.connection();
-    let hourly: Vec<(String, String)> =
-        redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
-    let daily: Vec<(String, String)> =
-        redis::cmd("HGETALL").arg("rl:alice:4096").query(&mut connection).expect("hgetall");
-    assert!(hourly.is_empty(), "rejected message must not be recorded in any window");
-    assert!(daily.is_empty(), "rejected message must not be recorded in any window");
-
-    // Fits both windows: accepted and recorded in both.
+    // Fits both windows: accepted and recorded in both. The 1h and 1d windows
+    // land on different bucket sizes, so each gets its own key - discovered
+    // rather than assumed, so a change to that computation makes this fail
+    // loudly instead of silently checking the wrong keys.
     let response = daemon.request("alice", 2);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
-    let hourly: Vec<(String, String)> =
-        redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
-    let daily: Vec<(String, String)> =
-        redis::cmd("HGETALL").arg("rl:alice:4096").query(&mut connection).expect("hgetall");
-    assert_eq!(hourly.len(), 1, "accepted message should be recorded in the hourly window");
-    assert_eq!(daily.len(), 1, "accepted message should be recorded in the daily window");
+    let keys = valkey.keys("rl:alice:*");
+    assert_eq!(keys.len(), 2, "the hourly and daily windows should each get their own key");
+    let mut connection = valkey.connection();
+    for key in &keys {
+        let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(key).query(&mut connection).expect("hgetall");
+        assert_eq!(fields.len(), 1, "accepted message should be recorded once in {key}");
+    }
 }
 
 #[test]
@@ -532,25 +534,37 @@ fn expired_entries_stop_counting_against_the_limit() {
          windows = [ { count = 1, duration = \"60s\" } ]\n",
     );
 
-    // A 60s window lands on a 2s bucket size (see `config::bucket_size`). Seed a
-    // bucket far outside the window's lookback, as if a message had been
-    // recorded and then aged out - real time never needs to pass for that to
-    // happen.
-    let stale_bucket = valkey.current_bucket(2) - 1000;
+    // Discover the real key this window's config computes, via a throwaway
+    // username so as not to spend alice's own count-1 limit finding out -
+    // rather than assuming a bucket size, so a change to that computation
+    // makes this test fail loudly instead of silently seeding (and later
+    // checking) a key the daemon never touches.
+    let probe_response = daemon.request("probe", 1);
+    assert_eq!(probe_response, format!("action={ACTION_DUNNO}\n\n"), "probe message should be accepted");
+    let probe_keys = valkey.keys("rl:probe:*");
+    assert_eq!(probe_keys.len(), 1, "expected exactly one key for the probe window");
+    let bucket_size: u64 = probe_keys[0]
+        .rsplit(':')
+        .next()
+        .expect("key has a bucket-size suffix")
+        .parse()
+        .expect("bucket size is numeric");
+    let key = format!("rl:alice:{bucket_size}");
+
+    // Seed a bucket far outside the window's lookback, as if a message had
+    // been recorded and then aged out - real time never needs to pass for
+    // that to happen.
+    let stale_bucket = valkey.current_bucket(bucket_size) - 1000;
     let mut connection = valkey.connection();
-    let _: () = redis::cmd("HSET")
-        .arg("rl:alice:2")
-        .arg(stale_bucket)
-        .arg(1)
-        .query(&mut connection)
-        .expect("seed stale bucket");
+    let _: () =
+        redis::cmd("HSET").arg(&key).arg(stale_bucket).arg(1).query(&mut connection).expect("seed stale bucket");
 
     // The stale entry must not count against the limit.
     let response = daemon.request("alice", 1);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
     // It must also have been pruned once touched, leaving only the new entry.
-    let fields: Vec<String> = redis::cmd("HKEYS").arg("rl:alice:2").query(&mut connection).expect("hkeys");
+    let fields: Vec<String> = redis::cmd("HKEYS").arg(&key).query(&mut connection).expect("hkeys");
     assert_eq!(fields.len(), 1, "the expired entry should have been pruned, leaving only the new one");
     assert_ne!(fields[0], stale_bucket.to_string(), "the surviving entry should be the new bucket, not the stale one");
 }
@@ -699,11 +713,18 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
         "the 16d window should have already stopped counting the 20-day-old message"
     );
 
+    // Both windows should indeed share one key - the premise this test's name
+    // rests on - discovered rather than assumed, so a change to the bucket-size
+    // computation makes this fail loudly instead of silently checking a key
+    // the daemon never touches.
+    let keys = valkey.keys("rl:alice:*");
+    assert_eq!(keys.len(), 1, "the 16d and 31d windows should share one key");
+
     // The 20-day-old entry must still be physically present, though - it's
     // excluded from the 16d window's own sum, not yet pruned from the shared
     // key, since the key's retention is the 31d window's longer span.
     let mut connection = valkey.connection();
-    let fields: Vec<String> = redis::cmd("HKEYS").arg("rl:alice:65536").query(&mut connection).expect("hkeys");
+    let fields: Vec<String> = redis::cmd("HKEYS").arg(&keys[0]).query(&mut connection).expect("hkeys");
     assert_eq!(fields.len(), 2, "the 20-day-old entry should still be present (not yet pruned), alongside the new one");
 }
 
@@ -724,8 +745,9 @@ fn tls_connection_to_valkey_with_custom_ca() {
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
     // Confirms the check actually went through the TLS-only server, not a fallback.
+    let keys = valkey.keys("rl:alice:*");
+    assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
-    let fields: Vec<(String, String)> =
-        redis::cmd("HGETALL").arg("rl:alice:128").query(&mut connection).expect("hgetall");
+    let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
     assert_eq!(fields.len(), 1, "expected exactly one recorded bucket");
 }

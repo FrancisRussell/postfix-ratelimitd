@@ -520,9 +520,17 @@ mod tests {
 
     #[test]
     fn shared_bucket_size_retention_is_the_longer_windows_span() {
-        // 3600s and 4200s both land on a 128s bucket size (see
-        // config::bucket_size), so they share one key - its retention must
-        // cover the longer (4200s) window, not just the first one seen.
+        // Chosen because they land on the same bucket size (checked below as
+        // the test's premise, not assumed), so they share one key - its
+        // retention must cover the longer (4200s) window, not just the first
+        // one seen. Expected spans/retention are derived from the real
+        // bucket_size/lookback_buckets functions rather than hardcoded, so
+        // this keeps testing the same property under any legitimate retuning
+        // of BUCKET_TARGET_COUNT or the bucket-size ladder.
+        let short = Duration::from_secs(3600);
+        let long = Duration::from_secs(4200);
+        assert_eq!(bucket_size(short), bucket_size(long), "test premise: both durations should share a bucket size");
+
         let toml = format!(
             "{BASE}\n\
              [[limits]]\n\
@@ -531,10 +539,13 @@ mod tests {
         );
         let config = load(&toml).expect("valid config");
         let plan = config.plan_for("anyone");
-        assert_eq!(plan.bucket_sizes, vec![128], "both windows should share one bucket size");
-        assert_eq!(plan.windows[0].span_secs, 3712);
-        assert_eq!(plan.windows[1].span_secs, 4224);
-        assert_eq!(plan.retention_secs, vec![4224], "retention must cover the longer window's span");
+        assert_eq!(plan.bucket_sizes, vec![bucket_size(short).as_secs()], "both windows should share one bucket size");
+
+        let short_span = lookback_buckets(short) * bucket_size(short).as_secs();
+        let long_span = lookback_buckets(long) * bucket_size(long).as_secs();
+        assert_eq!(plan.windows[0].span_secs, short_span);
+        assert_eq!(plan.windows[1].span_secs, long_span);
+        assert_eq!(plan.retention_secs, vec![long_span], "retention must cover the longer window's span");
     }
 
     #[test]
