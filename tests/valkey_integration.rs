@@ -812,11 +812,15 @@ fn overcount_bound_holds_against_real_recorded_data() {
     );
     drop(daemon);
 
-    // Just past the worst-case overcount the design permits (duration +
-    // duration/BUCKET_TARGET_COUNT): the ceiling guarantee means it's
-    // excluded by here, whatever this duration's actual span happens to be.
-    let worst_case_overcount = duration_secs / BUCKET_TARGET_COUNT;
-    let past_worst_case = (base_now + duration_secs + worst_case_overcount + 1).to_string();
+    // Two independent sources of overcount stack here: the retained span can
+    // exceed duration by up to duration/BUCKET_TARGET_COUNT (the ceiling
+    // guarantee), and the bucketing scheme adds up to one more bucket's worth
+    // of slack depending on where within its own bucket the message lands -
+    // not under this test's control, since base_now is seeded from the real
+    // clock. bucket_size is itself bounded by that same
+    // duration/BUCKET_TARGET_COUNT quantity, so doubling it safely covers both.
+    let worst_case_slack = 2 * (duration_secs / BUCKET_TARGET_COUNT);
+    let past_worst_case = (base_now + duration_secs + worst_case_slack + 1).to_string();
     let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", past_worst_case.as_str())]);
     let response = daemon.request("alice", 1);
     assert_eq!(
