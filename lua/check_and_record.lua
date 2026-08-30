@@ -81,10 +81,14 @@ for i = 1, num_keys do
     redis.call('EXPIRE', KEYS[i], plan.retention_secs[i])
 
     local oldest = now - plan.retention_secs[i]
+    local stale = {}
     for _, entry in ipairs(buckets_by_key[i]) do
         if (entry.id + 1) * bucket_size <= oldest then
-            redis.call('HDEL', KEYS[i], entry.id)
+            stale[#stale + 1] = entry.id
         end
+    end
+    if #stale > 0 then
+        redis.call('HDEL', KEYS[i], unpack(stale))
     end
 end
 
