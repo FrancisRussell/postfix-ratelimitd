@@ -22,30 +22,34 @@ RestartSec=2
 
 # Runs as its own dedicated, unprivileged identity rather than as `postfix` -
 # a compromise of this daemon then can't inherit whatever wider privileges
-# Postfix itself has. DynamicUser=yes allocates that identity automatically,
-# so no `useradd` step is needed at install time.
-DynamicUser=yes
+# Postfix itself has. This assumes a static postfix-ratelimitd system
+# user/group already exists - how to create one is a packaging decision
+# (sysusers.d, useradd in a postinst script, etc.) left to whoever packages
+# this. A persistent account is needed here, rather than DynamicUser=yes's
+# ephemeral one, since Postfix needs a stable group name to be durably added
+# to - see below.
+User=postfix-ratelimitd
 
-# Creates /run/postfix-ratelimitd, owned by this service's dynamic user, mode
-# 0755 by default - matches the default `server.socket` path in the example
-# config. Postfix reaches the socket file inside it via that file's own
-# world-read-write permission (set by this daemon itself, not by directory
-# permissions - see main.rs's SOCKET_MODE), so no shared group membership
-# with Postfix is needed for this default location.
+# Creates /run/postfix-ratelimitd, owned by postfix-ratelimitd:postfix-ratelimitd,
+# mode 0750 - matches the default `server.socket` path in the example config.
+# Combined with the socket file itself being mode 0660 (main.rs's
+# SOCKET_MODE), only this daemon's own user and members of its group can
+# reach the socket at all - which by default is nobody but this daemon, since
+# nothing else is in that group yet. Run
+# `usermod -aG postfix-ratelimitd postfix` once, in either installation order
+# relative to this package, to let Postfix in; its smtpd process picks up the
+# new supplementary group on its next restart.
 RuntimeDirectory=postfix-ratelimitd
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0750
 
 # If instead using the chrooted-Postfix alternative socket location documented
 # in the example config (somewhere under /var/spool/postfix), RuntimeDirectory=
-# can't help - that path isn't one systemd manages automatically. Replace
-# DynamicUser=yes and the RuntimeDirectory= lines above with a fixed identity
-# and an explicit directory-creation step instead, e.g.:
-#   User=postfix-ratelimitd
-#   Group=postfix-ratelimitd
-#   ExecStartPre=/usr/bin/install -d -m 2750 -o postfix-ratelimitd -g postfix /var/spool/postfix/postfix-ratelimitd
-# The setgid bit (the leading 2 in 2750) and postfix as the group make the
-# directory reachable by Postfix's own default group membership, without
-# adding this daemon to Postfix's group or Postfix to this daemon's group.
+# can't help - that path isn't one systemd manages automatically. Replace the
+# RuntimeDirectory= lines above with an explicit directory-creation step
+# instead, e.g.:
+#   ExecStartPre=/usr/bin/install -d -m 0750 -o postfix-ratelimitd -g postfix-ratelimitd /var/spool/postfix/postfix-ratelimitd
+# usermod -aG postfix-ratelimitd postfix is still what grants Postfix access
+# either way - this alternative only changes where the socket file lives.
 
 # No capabilities, privileges, or filesystem access beyond what's needed to
 # read its config and create its own socket.

@@ -63,7 +63,10 @@ struct Cli {
 /// wiring.
 const EXPECTED_PROTOCOL_STATE: &str = "DATA";
 
-const SOCKET_MODE: u32 = 0o666;
+/// Owner and group get read-write access, nobody else does - restricting who
+/// can reach the socket to whichever group the deploying systemd unit puts
+/// this daemon and Postfix in together (see packaging/postfix-ratelimitd.service).
+const SOCKET_MODE: u32 = 0o660;
 const SOCKET_PROBE_PREFIX: &str = ".rl-check-";
 
 /// Comfortably above realistic load, kept under common fd-limit defaults

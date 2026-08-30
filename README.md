@@ -25,6 +25,10 @@ password_file = "/etc/valkey/password"
 # Postfix's smtpd isn't chrooted - a chrooted smtpd can't see anything
 # outside its chroot (usually /var/spool/postfix), regardless of path.
 #
+# Only this daemon's own user and group can reach the socket by default -
+# see packaging/postfix-ratelimitd.service for the one-off step that grants
+# Postfix access.
+#
 # If your smtpd is chrooted (common on Debian/Ubuntu), put the socket under
 # the chroot instead, e.g.:
 #   socket = "/var/spool/postfix/postfix-ratelimitd/ratelimit.sock"
