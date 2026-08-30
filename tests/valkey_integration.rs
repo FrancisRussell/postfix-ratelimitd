@@ -599,6 +599,115 @@ fn a_week_long_window_expires_via_the_real_check_and_record_logic() {
 }
 
 #[test]
+fn window_lifecycle_at_the_minimum_duration_extreme() {
+    let valkey = ValkeyInstance::start_unix();
+    // 60s is MIN_WINDOW_DURATION; it lands on a 2s bucket size with a span_secs
+    // of exactly 60s (see
+    // config::tests::bucket_size_hits_target_count_at_min_window_duration).
+    let config = "redis.key_prefix = \"rl:\"\n\
+                  [[limits]]\n\
+                  type = \"default\"\n\
+                  windows = [ { count = 1, duration = \"60s\" } ]\n";
+    let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
+
+    let now = base_now.to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit in an empty window");
+    drop(daemon);
+
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(
+        response,
+        format!("action={ACTION_RATE_LIMITED}\n\n"),
+        "a second message in the same instant should be rejected"
+    );
+    drop(daemon);
+
+    let later = (base_now + 120).to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", later.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the message should have aged out of the 60s window");
+}
+
+#[test]
+fn window_lifecycle_at_the_maximum_duration_extreme() {
+    let valkey = ValkeyInstance::start_unix();
+    // 31d is MAX_WINDOW_DURATION; it clamps to MAX_BUCKET_SIZE (65536s), giving
+    // a span_secs of 2,686,976s (~31.09d, not the nominal 2,678,400s) - see
+    // config::tests::bucket_size_is_clamped_to_max_at_max_window_duration.
+    let config = "redis.key_prefix = \"rl:\"\n\
+                  [[limits]]\n\
+                  type = \"default\"\n\
+                  windows = [ { count = 1, duration = \"31d\" } ]\n";
+    let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
+
+    let now = base_now.to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit in an empty window");
+    drop(daemon);
+
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(
+        response,
+        format!("action={ACTION_RATE_LIMITED}\n\n"),
+        "a second message in the same instant should be rejected"
+    );
+    drop(daemon);
+
+    // Past the actual ~31.09d span, not just the nominal 31 days.
+    let later = (base_now + 33 * 24 * 60 * 60).to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", later.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the message should have aged out of the 31d window");
+}
+
+#[test]
+fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
+    let valkey = ValkeyInstance::start_unix();
+    // A 16d and a 31d window both clamp to MAX_BUCKET_SIZE (65536s) and so
+    // share one Redis key, but their own spans differ (~16.68d vs ~31.09d) -
+    // the shared key's retention (and prune cutoff) is the longer of the two,
+    // so an entry can correctly stop counting against the 16d window's own
+    // limit long before it's actually deleted.
+    let config = "redis.key_prefix = \"rl:\"\n\
+                  [[limits]]\n\
+                  type = \"default\"\n\
+                  windows = [ { count = 1, duration = \"16d\" }, { count = 5, duration = \"31d\" } ]\n";
+    let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
+
+    let now = base_now.to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit both empty windows");
+    drop(daemon);
+
+    // 20 days later: past the 16d window's own ~16.68d span, but well before
+    // the shared key's ~31.09d retention. If the 16d window incorrectly used
+    // the shared key's longer retention as its own cutoff instead of its own
+    // span, this message would push its count-1 limit to 2 and be rejected.
+    let twenty_days_later = (base_now + 20 * 24 * 60 * 60).to_string();
+    let daemon =
+        Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", twenty_days_later.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(
+        response,
+        format!("action={ACTION_DUNNO}\n\n"),
+        "the 16d window should have already stopped counting the 20-day-old message"
+    );
+
+    // The 20-day-old entry must still be physically present, though - it's
+    // excluded from the 16d window's own sum, not yet pruned from the shared
+    // key, since the key's retention is the 31d window's longer span.
+    let mut connection = valkey.connection();
+    let fields: Vec<String> = redis::cmd("HKEYS").arg("rl:alice:65536").query(&mut connection).expect("hkeys");
+    assert_eq!(fields.len(), 2, "the 20-day-old entry should still be present (not yet pruned), alongside the new one");
+}
+
+#[test]
 fn tls_connection_to_valkey_with_custom_ca() {
     let valkey = ValkeyInstance::start_tls();
     let ca_cert = valkey.tls_ca_cert().to_str().expect("fixture CA path is valid UTF-8");
