@@ -20,9 +20,17 @@
 --     span_secs is the window's duration rounded up to a whole number of
 --     buckets (computed once from config, not here, since it doesn't depend
 --     on anything in KEYS).
+-- ARGV[3]: optional; a fixed unix timestamp to use as "now" instead of
+-- calling TIME, for tests that need to exercise weeks- or months-long
+-- windows without real time passing (see limiter.rs's fake_now). Never sent
+-- outside tests.
 
-local time = redis.call('TIME')
-local now = tonumber(time[1])
+local now
+if ARGV[3] then
+    now = tonumber(ARGV[3])
+else
+    now = tonumber(redis.call('TIME')[1])
+end
 
 local recipient_count = tonumber(ARGV[1])
 local plan = cjson.decode(ARGV[2])

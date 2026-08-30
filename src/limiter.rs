@@ -23,6 +23,12 @@ const CONNECTION_RETRIES: usize = 3;
 /// default backoff can reach tens of seconds per attempt.
 const CONNECTION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
+/// Test-only escape hatch: when set, a fixed unix timestamp `check` sends the
+/// script as "now" instead of letting it call Valkey's own TIME - lets a test
+/// exercise weeks- or months-long windows without real time passing. Not a
+/// documented config option; never set outside tests.
+const FAKE_NOW_ENV_VAR: &str = "POSTFIX_RATELIMITD_FAKE_NOW";
+
 /// Checks and records recipient counts against Valkey via
 /// `check_and_record.lua`.
 #[derive(Clone)]
@@ -30,6 +36,7 @@ pub struct Limiter {
     connection_manager: ConnectionManager,
     key_prefix: String,
     script: Script,
+    fake_now: Option<u64>,
 }
 
 impl Limiter {
@@ -43,7 +50,8 @@ impl Limiter {
             .set_number_of_retries(CONNECTION_RETRIES)
             .set_max_delay(CONNECTION_RETRY_MAX_DELAY);
         let connection_manager = client.get_connection_manager_with_config(manager_config).await?;
-        Ok(Limiter { connection_manager, key_prefix, script: Script::new(CHECK_AND_RECORD) })
+        let fake_now = std::env::var(FAKE_NOW_ENV_VAR).ok().and_then(|value| value.parse().ok());
+        Ok(Limiter { connection_manager, key_prefix, script: Script::new(CHECK_AND_RECORD), fake_now })
     }
 
     /// Records `recipient_count` only if every window in `plan` accepts it;
@@ -66,6 +74,9 @@ impl Limiter {
         }
 
         invocation.arg(recipient_count).arg(plan.json());
+        if let Some(fake_now) = self.fake_now {
+            invocation.arg(fake_now);
+        }
 
         let allowed: i64 = invocation.invoke_async(&mut connection).await?;
         Ok(allowed == 1)

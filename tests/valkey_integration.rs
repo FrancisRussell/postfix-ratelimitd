@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use postfix_ratelimitd::{ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE};
 
@@ -553,6 +553,49 @@ fn expired_entries_stop_counting_against_the_limit() {
     let fields: Vec<String> = redis::cmd("HKEYS").arg("rl:alice:2").query(&mut connection).expect("hkeys");
     assert_eq!(fields.len(), 1, "the expired entry should have been pruned, leaving only the new one");
     assert_ne!(fields[0], stale_bucket.to_string(), "the surviving entry should be the new bucket, not the stale one");
+}
+
+#[test]
+fn a_week_long_window_expires_via_the_real_check_and_record_logic() {
+    let valkey = ValkeyInstance::start_unix();
+    let config = "redis.key_prefix = \"rl:\"\n\
+                  [[limits]]\n\
+                  type = \"default\"\n\
+                  windows = [ { count = 1, duration = \"7d\" } ]\n";
+    let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
+
+    // POSTFIX_RATELIMITD_FAKE_NOW fixes what the real check_and_record.lua sees
+    // as "now", so real messages can be recorded and aged out across a
+    // week-long window without waiting a week - the daemon holds no state of
+    // its own between requests, so restarting it with a different fake time is
+    // equivalent to time passing for a real, long-lived daemon.
+    let now = base_now.to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit in an empty window");
+    drop(daemon);
+
+    // Immediately after, still within the window: a second message exceeds the
+    // count-1 limit.
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(
+        response,
+        format!("action={ACTION_RATE_LIMITED}\n\n"),
+        "a second message in the same instant should be rejected"
+    );
+    drop(daemon);
+
+    // 8 days later, past the 7d window: the first message has aged out, so a
+    // new one fits again.
+    let eight_days_later = (base_now + 8 * 24 * 60 * 60).to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", eight_days_later.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(
+        response,
+        format!("action={ACTION_DUNNO}\n\n"),
+        "the week-old message should have aged out of the 7d window"
+    );
 }
 
 #[test]
