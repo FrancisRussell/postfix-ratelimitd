@@ -471,19 +471,28 @@ mod tests {
     }
 
     #[test]
-    fn bucket_size_never_gives_fewer_than_target_count_buckets() {
-        // Sweep representative durations across the whole valid range, checking the one
-        // invariant the selection rule is supposed to guarantee everywhere: a window is
-        // never aggregated into fewer than BUCKET_TARGET_COUNT buckets (only ever that
-        // many or more), whether or not it lands exactly on a ladder rung's boundary.
+    fn bucket_size_never_overcounts_by_more_than_the_target_fraction() {
+        // The two guarantees bucket_size/lookback_buckets exist to provide, for every
+        // valid window duration, whether or not it lands exactly on a ladder rung's
+        // boundary: at least BUCKET_TARGET_COUNT buckets, and a retained span (rounding
+        // duration up to a whole number of buckets, since a partially-elapsed boundary
+        // bucket always counts in full) that overcounts by no more than
+        // 1/BUCKET_TARGET_COUNT (5%) of the window's own duration. Exhaustive over
+        // every second in the valid range rather than sampled, since it's cheap
+        // enough (milliseconds) not to need to be.
         let mut duration = MIN_WINDOW_DURATION;
         while duration <= MAX_WINDOW_DURATION {
+            let secs = duration.as_secs();
+            let size = bucket_size(duration).as_secs();
+            let buckets = lookback_buckets(duration);
+            assert!(buckets >= BUCKET_TARGET_COUNT, "{duration:?} only gets {buckets} buckets");
+
+            let overcount = buckets * size - secs;
             assert!(
-                lookback_buckets(duration) >= BUCKET_TARGET_COUNT,
-                "{duration:?} only gets {} buckets",
-                lookback_buckets(duration)
+                overcount * BUCKET_TARGET_COUNT <= secs,
+                "{duration:?} overcounts by {overcount}s, exceeding the 1/{BUCKET_TARGET_COUNT} bound"
             );
-            duration += Duration::from_secs(3600);
+            duration += Duration::from_secs(1);
         }
     }
 
