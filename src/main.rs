@@ -57,6 +57,10 @@ struct Cli {
     /// Ignored unless --log-target=syslog.
     #[arg(long)]
     syslog_ident: Option<String>,
+
+    /// Minimum severity to log: off, error, warn, info, debug, or trace
+    #[arg(long, default_value = "info")]
+    log_level: log::LevelFilter,
 }
 
 /// Expected `protocol_state` for this daemon per its `smtpd_data_restrictions`
@@ -294,12 +298,12 @@ fn fatal(message: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-/// Installs the `log` backend `target` selects. Called before anything else
-/// in `main`, including config loading, so that even a config-load failure
-/// gets logged through the right backend.
-fn init_logging(target: LogTarget, syslog_ident: Option<&str>) {
+/// Installs the `log` backend `target` selects, filtered to `level`. Called
+/// before anything else in `main`, including config loading, so that even a
+/// config-load failure gets logged through the right backend.
+fn init_logging(target: LogTarget, syslog_ident: Option<&str>, level: log::LevelFilter) {
     match target {
-        LogTarget::Stdout => env_logger::init(),
+        LogTarget::Stdout => env_logger::Builder::new().filter_level(level).init(),
         LogTarget::Syslog => {
             let ident = syslog_ident.unwrap_or(env!("CARGO_PKG_NAME")).to_string();
             let formatter = syslog::Formatter3164 {
@@ -310,12 +314,6 @@ fn init_logging(target: LogTarget, syslog_ident: Option<&str>) {
             };
             match syslog::unix(formatter) {
                 Ok(logger) => {
-                    // Mirrors RUST_LOG's simple `<level>` form, since env_logger's fuller
-                    // per-module filter syntax isn't reusable outside its own Builder.
-                    let level = std::env::var("RUST_LOG")
-                        .ok()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(log::LevelFilter::Info);
                     log::set_boxed_logger(Box::new(syslog::BasicLogger::new(logger)))
                         .map(|()| log::set_max_level(level))
                         .expect("no logger installed yet");
@@ -324,7 +322,7 @@ fn init_logging(target: LogTarget, syslog_ident: Option<&str>) {
                     // env_logger isn't installed yet here, so this can only reach the user via
                     // stderr directly.
                     eprintln!("failed to connect to syslog, falling back to stdout: {err}");
-                    env_logger::init();
+                    env_logger::Builder::new().filter_level(level).init();
                 }
             }
         }
@@ -396,7 +394,7 @@ async fn reload_config(path: &std::path::Path, config: &ArcSwap<Config>, limiter
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    init_logging(cli.log_target, cli.syslog_ident.as_deref());
+    init_logging(cli.log_target, cli.syslog_ident.as_deref(), cli.log_level);
 
     let config = match Config::load(&cli.config) {
         Ok(config) => config,

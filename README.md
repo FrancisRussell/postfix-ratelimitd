@@ -125,6 +125,7 @@ postfix-ratelimitd --config /etc/postfix-ratelimitd/config.toml
 | `-t`, `--check-config` | Validate the config file and exit |
 | `--log-target <stdout\|syslog>` | Where to send log output (default `stdout`) |
 | `--syslog-ident <NAME>` | Syslog "ident" prefix on each line; defaults to the binary name. Ignored unless `--log-target=syslog` |
+| `--log-level <off\|error\|warn\|info\|debug\|trace>` | Minimum severity to log (default `info`) |
 
 `-t` parses the config, resolves `redis.url`/`redis.password_file` into a
 connection (without opening it or touching Valkey), compiles regexes, checks
@@ -143,9 +144,8 @@ syslog socket. `--log-target syslog` instead sends RFC 3164 syslog via
 message priority and attributes entries to this service's systemd unit the
 same as native journal capture) or a standalone rsyslog/syslog-ng.
 
-The `RUST_LOG` environment variable controls verbosity for both targets,
-e.g. `RUST_LOG=debug`; unset, both default to `info`. At `debug`, every
-check logs its own accept/reject outcome along with the SASL username and
+`--log-level` controls verbosity for both targets. At `debug`, every check
+logs its own accept/reject outcome along with the SASL username and
 recipient count involved - noisy enough that it's meant for confirming a new
 deployment is wired up correctly, not for routine use.
 
