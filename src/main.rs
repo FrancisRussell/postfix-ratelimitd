@@ -207,10 +207,12 @@ async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -
     match limiter.check(sasl_username, recipient_count, plan).await {
         Ok(true) => {
             STATS.accepted.fetch_add(1, Ordering::SeqCst);
+            log::debug!("accepted {sasl_username}: {recipient_count} recipients");
             ACTION_DUNNO
         }
         Ok(false) => {
             STATS.rejected.fetch_add(1, Ordering::SeqCst);
+            log::debug!("rejected {sasl_username}: {recipient_count} recipients over limit");
             ACTION_RATE_LIMITED
         }
         Err(err) => {
