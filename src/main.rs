@@ -205,11 +205,7 @@ async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -
     };
 
     let plan = config.plan_for(sasl_username);
-    #[cfg(feature = "integration-tests")]
-    let now_override = request.now_override();
-    #[cfg(not(feature = "integration-tests"))]
-    let now_override = None;
-    match limiter.check(sasl_username, recipient_count, plan, now_override).await {
+    match limiter.check(sasl_username, recipient_count, plan, request.now_override()).await {
         Ok(true) => {
             STATS.accepted.fetch_add(1, Ordering::SeqCst);
             log::debug!("accepted {sasl_username}: {recipient_count} recipients");
