@@ -12,6 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use postfix_ratelimitd::config::BUCKET_TARGET_COUNT;
 use postfix_ratelimitd::{ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE};
 
 /// How long to wait for a spawned `valkey-server` or daemon to become ready.
@@ -776,6 +777,53 @@ fn multi_window_rule_ages_out_each_window_independently() {
     let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", two_hours_later.as_str())]);
     let response = daemon.request("alice", 1);
     assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"), "the daily cap should already be exactly full");
+}
+
+#[test]
+fn overcount_bound_holds_against_real_recorded_data() {
+    let valkey = ValkeyInstance::start_unix();
+    // What matters here is only the documented bound itself
+    // (BUCKET_TARGET_COUNT), not this duration's specific resulting bucket
+    // size or span - computed from the real constant so this can't silently
+    // drift out of sync with it, unlike asserting a specific span value would.
+    let duration_secs = 3600u64;
+    let config = "redis.key_prefix = \"rl:\"\n\
+                  [[limits]]\n\
+                  type = \"default\"\n\
+                  windows = [ { count = 1, duration = \"3600s\" } ]\n";
+    let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
+
+    let now = base_now.to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "first message should fit an empty window");
+    drop(daemon);
+
+    // Exactly at the window's true nominal duration: the floor guarantee (a
+    // message is never excluded before its window has actually elapsed)
+    // means it must still count here, however the bucketing scheme rounds.
+    let at_true_duration = (base_now + duration_secs).to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", at_true_duration.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(
+        response,
+        format!("action={ACTION_RATE_LIMITED}\n\n"),
+        "a message must still count exactly at its window's true duration"
+    );
+    drop(daemon);
+
+    // Just past the worst-case overcount the design permits (duration +
+    // duration/BUCKET_TARGET_COUNT): the ceiling guarantee means it's
+    // excluded by here, whatever this duration's actual span happens to be.
+    let worst_case_overcount = duration_secs / BUCKET_TARGET_COUNT;
+    let past_worst_case = (base_now + duration_secs + worst_case_overcount + 1).to_string();
+    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", past_worst_case.as_str())]);
+    let response = daemon.request("alice", 1);
+    assert_eq!(
+        response,
+        format!("action={ACTION_DUNNO}\n\n"),
+        "a message must be excluded once past the documented worst-case overcount"
+    );
 }
 
 #[test]
