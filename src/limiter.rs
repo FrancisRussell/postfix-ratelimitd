@@ -24,12 +24,6 @@ const CONNECTION_RETRIES: usize = 3;
 /// default backoff can reach tens of seconds per attempt.
 const CONNECTION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
-/// Test-only escape hatch: when set, a fixed unix timestamp `check` sends the
-/// script as "now" instead of letting it call Valkey's own TIME - lets a test
-/// exercise weeks- or months-long windows without real time passing. Not a
-/// documented config option; never set outside tests.
-const FAKE_NOW_ENV_VAR: &str = "POSTFIX_RATELIMITD_FAKE_NOW";
-
 /// One `check_and_record.lua` invocation's arguments, sent as a single JSON
 /// value rather than flattened into positional arguments, so the two sides
 /// can't silently drift out of step on argument order or count.
@@ -38,11 +32,13 @@ struct CheckRequest<'a> {
     recipient_count: u32,
     // Omitted entirely rather than sent as JSON `null` when absent: cjson
     // decodes a JSON `null` to the sentinel `cjson.null`, not Lua's `nil` -
-    // which is truthy, so the script's `if request.fake_now then` check would
+    // which is truthy, so the script's `if request.now_override then` check would
     // misfire on every request if this were serialized as `null` instead of
-    // left out.
+    // left out. Only ever `Some` when the caller got it from
+    // `Request::now_override`, which doesn't exist outside the integration-tests
+    // feature - see there for why this doesn't need its own gate here too.
     #[serde(skip_serializing_if = "Option::is_none")]
-    fake_now: Option<u64>,
+    now_override: Option<u64>,
     plan: CheckPlanFields<'a>,
 }
 
@@ -53,7 +49,6 @@ pub struct Limiter {
     connection_manager: ConnectionManager,
     key_prefix: String,
     script: Script,
-    fake_now: Option<u64>,
 }
 
 impl Limiter {
@@ -67,8 +62,7 @@ impl Limiter {
             .set_number_of_retries(CONNECTION_RETRIES)
             .set_max_delay(CONNECTION_RETRY_MAX_DELAY);
         let connection_manager = client.get_connection_manager_with_config(manager_config).await?;
-        let fake_now = std::env::var(FAKE_NOW_ENV_VAR).ok().and_then(|value| value.parse().ok());
-        Ok(Limiter { connection_manager, key_prefix, script: Script::new(CHECK_AND_RECORD), fake_now })
+        Ok(Limiter { connection_manager, key_prefix, script: Script::new(CHECK_AND_RECORD) })
     }
 
     /// Records `recipient_count` only if every window in `plan` accepts it;
@@ -80,8 +74,12 @@ impl Limiter {
     /// reference it. `plan`'s bucket sizes and spans depend only on window
     /// durations, never on a request, but re-serializing them alongside
     /// `recipient_count` on every check is cheap enough not to be worth
-    /// caching separately.
-    pub async fn check(&self, sasl_username: &str, recipient_count: u32, plan: &CheckPlan) -> redis::RedisResult<bool> {
+    /// caching separately. `now_override` should only ever be `Some` from a
+    /// request under the integration-tests feature - see
+    /// `Request::now_override`.
+    pub async fn check(
+        &self, sasl_username: &str, recipient_count: u32, plan: &CheckPlan, now_override: Option<u64>,
+    ) -> redis::RedisResult<bool> {
         let mut connection = self.connection_manager.clone();
         let mut invocation = self.script.prepare_invoke();
 
@@ -89,7 +87,7 @@ impl Limiter {
             invocation.key(format!("{}{}:{}", self.key_prefix, sasl_username, bucket_size));
         }
 
-        let request = CheckRequest { recipient_count, fake_now: self.fake_now, plan: plan.fields() };
+        let request = CheckRequest { recipient_count, now_override, plan: plan.fields() };
         let request =
             serde_json::to_string(&request).expect("CheckRequest contains no types that can fail to serialize");
         invocation.arg(request);

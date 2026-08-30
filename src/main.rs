@@ -205,7 +205,11 @@ async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -
     };
 
     let plan = config.plan_for(sasl_username);
-    match limiter.check(sasl_username, recipient_count, plan).await {
+    #[cfg(feature = "integration-tests")]
+    let now_override = request.now_override();
+    #[cfg(not(feature = "integration-tests"))]
+    let now_override = None;
+    match limiter.check(sasl_username, recipient_count, plan, now_override).await {
         Ok(true) => {
             STATS.accepted.fetch_add(1, Ordering::SeqCst);
             log::debug!("accepted {sasl_username}: {recipient_count} recipients");
@@ -390,6 +394,19 @@ async fn reload_config(path: &std::path::Path, config: &ArcSwap<Config>, limiter
 /// killed.
 #[tokio::main]
 async fn main() {
+    // Refuses to run at all unless explicitly acknowledged - see
+    // INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR. Before logging is set up, so
+    // this can only reach the user via stderr directly.
+    #[cfg(feature = "integration-tests")]
+    if std::env::var(postfix_ratelimitd::INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR).is_err() {
+        eprintln!(
+            "built with the integration-tests feature, which must never run in production - set \
+             {} to acknowledge this is a test build",
+            postfix_ratelimitd::INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR
+        );
+        std::process::exit(1);
+    }
+
     let cli = Cli::parse();
     init_logging(cli.log_target, cli.syslog_ident.as_deref(), cli.log_level);
 

@@ -13,7 +13,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use postfix_ratelimitd::config::BUCKET_TARGET_COUNT;
-use postfix_ratelimitd::{ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE};
+use postfix_ratelimitd::{
+    ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE,
+    INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR,
+};
 
 /// How long to wait for a spawned `valkey-server` or daemon to become ready.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -260,6 +263,10 @@ impl Daemon {
         let child = Command::new(env!("CARGO_BIN_EXE_postfix-ratelimitd"))
             .arg("--config")
             .arg(&config_path)
+            // The daemon binary refuses to start under the integration-tests feature
+            // without this - set unconditionally, not left to each call site, so it
+            // can't be forgotten.
+            .env(INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR, "1")
             .envs(env.iter().copied())
             .spawn()
             .expect("spawn daemon");
@@ -298,6 +305,16 @@ impl Daemon {
     fn request(&self, sasl_username: &str, recipient_count: u32) -> String {
         self.raw_request(&format!(
             "sasl_username={sasl_username}\nrecipient_count={recipient_count}\nprotocol_state=DATA\n\n"
+        ))
+    }
+
+    /// As [`Daemon::request`], but with a `now_override` attribute - lets one
+    /// long-running daemon be driven through a whole sequence of simulated
+    /// times, rather than restarting it for each one.
+    fn request_at(&self, sasl_username: &str, recipient_count: u32, now_override: u64) -> String {
+        self.raw_request(&format!(
+            "sasl_username={sasl_username}\nrecipient_count={recipient_count}\nprotocol_state=DATA\n\
+             now_override={now_override}\n\n"
         ))
     }
 }
@@ -579,33 +596,27 @@ fn a_week_long_window_expires_via_the_real_check_and_record_logic() {
                   windows = [ { count = 1, duration = \"7d\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
 
-    // POSTFIX_RATELIMITD_FAKE_NOW fixes what the real check_and_record.lua sees
-    // as "now", so real messages can be recorded and aged out across a
-    // week-long window without waiting a week - the daemon holds no state of
-    // its own between requests, so restarting it with a different fake time is
-    // equivalent to time passing for a real, long-lived daemon.
-    let now = base_now.to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
-    let response = daemon.request("alice", 1);
+    // now_override fixes what the real check_and_record.lua sees as "now" for
+    // one request, so real messages can be recorded and aged out across a
+    // week-long window without waiting a week - all sent to one long-running
+    // daemon, exactly as a real deployment would see requests arrive over
+    // real elapsed time.
+    let daemon = Daemon::start(&valkey, config);
+    let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit in an empty window");
-    drop(daemon);
 
     // Immediately after, still within the window: a second message exceeds the
     // count-1 limit.
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(
         response,
         format!("action={ACTION_RATE_LIMITED}\n\n"),
         "a second message in the same instant should be rejected"
     );
-    drop(daemon);
 
     // 8 days later, past the 7d window: the first message has aged out, so a
     // new one fits again.
-    let eight_days_later = (base_now + 8 * 24 * 60 * 60).to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", eight_days_later.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now + 8 * 24 * 60 * 60);
     assert_eq!(
         response,
         format!("action={ACTION_DUNNO}\n\n"),
@@ -625,24 +636,18 @@ fn window_lifecycle_at_the_minimum_duration_extreme() {
                   windows = [ { count = 1, duration = \"60s\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
 
-    let now = base_now.to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
-    let response = daemon.request("alice", 1);
+    let daemon = Daemon::start(&valkey, config);
+    let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit in an empty window");
-    drop(daemon);
 
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(
         response,
         format!("action={ACTION_RATE_LIMITED}\n\n"),
         "a second message in the same instant should be rejected"
     );
-    drop(daemon);
 
-    let later = (base_now + 120).to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", later.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now + 120);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the message should have aged out of the 60s window");
 }
 
@@ -658,25 +663,19 @@ fn window_lifecycle_at_the_maximum_duration_extreme() {
                   windows = [ { count = 1, duration = \"31d\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
 
-    let now = base_now.to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
-    let response = daemon.request("alice", 1);
+    let daemon = Daemon::start(&valkey, config);
+    let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit in an empty window");
-    drop(daemon);
 
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(
         response,
         format!("action={ACTION_RATE_LIMITED}\n\n"),
         "a second message in the same instant should be rejected"
     );
-    drop(daemon);
 
     // Past the actual ~31.09d span, not just the nominal 31 days.
-    let later = (base_now + 33 * 24 * 60 * 60).to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", later.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now + 33 * 24 * 60 * 60);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the message should have aged out of the 31d window");
 }
 
@@ -694,20 +693,15 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
                   windows = [ { count = 1, duration = \"16d\" }, { count = 5, duration = \"31d\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
 
-    let now = base_now.to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
-    let response = daemon.request("alice", 1);
+    let daemon = Daemon::start(&valkey, config);
+    let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit both empty windows");
-    drop(daemon);
 
     // 20 days later: past the 16d window's own ~16.68d span, but well before
     // the shared key's ~31.09d retention. If the 16d window incorrectly used
     // the shared key's longer retention as its own cutoff instead of its own
     // span, this message would push its count-1 limit to 2 and be rejected.
-    let twenty_days_later = (base_now + 20 * 24 * 60 * 60).to_string();
-    let daemon =
-        Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", twenty_days_later.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now + 20 * 24 * 60 * 60);
     assert_eq!(
         response,
         format!("action={ACTION_DUNNO}\n\n"),
@@ -743,24 +737,21 @@ fn multi_window_rule_ages_out_each_window_independently() {
                   type = \"default\"\n\
                   windows = [ { count = 20, duration = \"1h\" }, { count = 21, duration = \"1d\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
+    let daemon = Daemon::start(&valkey, config);
 
     // Fills the hourly cap exactly, and puts the daily one at 20/21.
-    let now = base_now.to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
-    let response = daemon.request("alice", 20);
+    let response = daemon.request_at("alice", 20, base_now);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "first message should fit both empty windows");
 
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"), "the hourly cap should already be full");
-    drop(daemon);
 
     // 2 hours later: past the hourly window's own span (~62 minutes), but
     // nowhere near the daily window's (~25 hours) - the hourly window should
     // have reset while the daily total (still counting the 2-hour-old
     // message) is exactly full at 21/21.
-    let two_hours_later = (base_now + 2 * 60 * 60).to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", two_hours_later.as_str())]);
-    let response = daemon.request("alice", 1);
+    let two_hours_later = base_now + 2 * 60 * 60;
+    let response = daemon.request_at("alice", 1, two_hours_later);
     assert_eq!(
         response,
         format!("action={ACTION_DUNNO}\n\n"),
@@ -774,8 +765,7 @@ fn multi_window_rule_ages_out_each_window_independently() {
     // window's shorter span for both (a real mistake this guards against:
     // reusing one window's cutoff for another), the daily window would
     // wrongly see only the last two messages and accept this one too.
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", two_hours_later.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, two_hours_later);
     assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"), "the daily cap should already be exactly full");
 }
 
@@ -792,25 +782,20 @@ fn overcount_bound_holds_against_real_recorded_data() {
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"3600s\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
+    let daemon = Daemon::start(&valkey, config);
 
-    let now = base_now.to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", now.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "first message should fit an empty window");
-    drop(daemon);
 
     // Exactly at the window's true nominal duration: the floor guarantee (a
     // message is never excluded before its window has actually elapsed)
     // means it must still count here, however the bucketing scheme rounds.
-    let at_true_duration = (base_now + duration_secs).to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", at_true_duration.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now + duration_secs);
     assert_eq!(
         response,
         format!("action={ACTION_RATE_LIMITED}\n\n"),
         "a message must still count exactly at its window's true duration"
     );
-    drop(daemon);
 
     // Two independent sources of overcount stack here: the retained span can
     // exceed duration by up to duration/BUCKET_TARGET_COUNT (the ceiling
@@ -820,9 +805,7 @@ fn overcount_bound_holds_against_real_recorded_data() {
     // clock. bucket_size is itself bounded by that same
     // duration/BUCKET_TARGET_COUNT quantity, so doubling it safely covers both.
     let worst_case_slack = 2 * (duration_secs / BUCKET_TARGET_COUNT);
-    let past_worst_case = (base_now + duration_secs + worst_case_slack + 1).to_string();
-    let daemon = Daemon::start_with_env(&valkey, config, &[("POSTFIX_RATELIMITD_FAKE_NOW", past_worst_case.as_str())]);
-    let response = daemon.request("alice", 1);
+    let response = daemon.request_at("alice", 1, base_now + duration_secs + worst_case_slack + 1);
     assert_eq!(
         response,
         format!("action={ACTION_DUNNO}\n\n"),

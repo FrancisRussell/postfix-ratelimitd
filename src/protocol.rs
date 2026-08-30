@@ -63,6 +63,14 @@ impl Request {
 
     /// The restriction class this request was sent from, e.g. "DATA" or "RCPT".
     pub fn protocol_state(&self) -> Option<&str> { self.attributes.get("protocol_state").map(String::as_str) }
+
+    /// A fixed unix timestamp for `Limiter::check` to use as "now" instead of
+    /// Valkey's own TIME - not a real Postfix attribute, so this only exists
+    /// under the integration-tests feature, letting a test drive one
+    /// long-running daemon through a whole sequence of simulated times rather
+    /// than restarting it for each one.
+    #[cfg(feature = "integration-tests")]
+    pub fn now_override(&self) -> Option<u64> { self.attributes.get("now_override")?.parse().ok() }
 }
 
 /// Writes a policy response, e.g. `write_action(w, "dunno")`.

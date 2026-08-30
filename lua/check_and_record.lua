@@ -9,7 +9,7 @@
 -- travel with the data instead of relying on this script and limiter.rs
 -- agreeing on an implicit argument order:
 --   recipient_count: recipient count for this message.
---   fake_now: optional; a fixed unix timestamp to use as "now" instead of
+--   now_override: optional; a fixed unix timestamp to use as "now" instead of
 --     calling TIME, for tests that need to exercise weeks- or months-long
 --     windows without real time passing. Never sent outside tests.
 --   plan: this check's precomputed bucket sizes and windows -
@@ -31,7 +31,7 @@ local plan = request.plan
 local bucket_sizes = plan.bucket_sizes
 local num_keys = #bucket_sizes
 
-local now = request.fake_now or tonumber(redis.call('TIME')[1])
+local now = request.now_override or tonumber(redis.call('TIME')[1])
 
 -- plan.windows' key_index is 0-based (matching bucket_sizes/limiter.rs);
 -- switch it to 1-based here, once, rather than adding 1 at every use below.
