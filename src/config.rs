@@ -150,10 +150,15 @@ pub struct CheckPlan {
 
 impl CheckPlan {
     /// Builds a plan from a rule's windows - see the `CheckPlan` docs above.
+    ///
+    /// Windows that end up sharing both `key_index` and `span_secs` are
+    /// checked against the exact same accumulated total, so only the
+    /// stricter (lower) of their limits can ever be the one that rejects -
+    /// the other is folded in rather than kept as a redundant entry.
     fn new(windows: &[Window]) -> CheckPlan {
         let mut bucket_sizes: Vec<u64> = Vec::new();
         let mut retention_secs: Vec<u64> = Vec::new();
-        let mut planned_windows = Vec::with_capacity(windows.len());
+        let mut planned_windows: Vec<PlannedWindow> = Vec::new();
         for window in windows {
             let size = bucket_size(window.duration).as_secs();
             let key_index = match bucket_sizes.iter().position(|&existing| existing == size) {
@@ -166,7 +171,11 @@ impl CheckPlan {
             };
             let span_secs = lookback_buckets(window.duration) * size;
             retention_secs[key_index] = retention_secs[key_index].max(span_secs);
-            planned_windows.push(PlannedWindow { key_index, span_secs, limit: window.count });
+
+            match planned_windows.iter_mut().find(|w| w.key_index == key_index && w.span_secs == span_secs) {
+                Some(existing) => existing.limit = existing.limit.min(window.count),
+                None => planned_windows.push(PlannedWindow { key_index, span_secs, limit: window.count }),
+            }
         }
         CheckPlan { bucket_sizes, windows: planned_windows, retention_secs }
     }
@@ -562,6 +571,20 @@ mod tests {
         assert_eq!(plan.windows[0].span_secs, short_span);
         assert_eq!(plan.windows[1].span_secs, long_span);
         assert_eq!(plan.retention_secs, vec![long_span], "retention must cover the longer window's span");
+    }
+
+    #[test]
+    fn windows_with_identical_span_keep_only_the_stricter_limit() {
+        let toml = format!(
+            "{BASE}\n\
+             [[limits]]\n\
+             type = \"default\"\n\
+             windows = [ {{ count = 100, duration = \"1h\" }}, {{ count = 20, duration = \"1h\" }} ]\n"
+        );
+        let config = load(&toml).expect("valid config");
+        let plan = config.plan_for("anyone");
+        assert_eq!(plan.windows.len(), 1, "identical-span windows should collapse into one");
+        assert_eq!(plan.windows[0].limit, 20, "the stricter (lower) limit should survive");
     }
 
     #[test]
