@@ -1,0 +1,94 @@
+on: [push]
+
+name: CI
+
+jobs:
+  cargo-test:
+    name: Cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install valkey-server
+        run: sudo apt-get install -y --no-install-recommends valkey-server
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Cargo cache
+        with:
+          command: cache
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Install Rustup
+        with:
+          command: install-rustup
+          toolchain: stable
+          profile: minimal
+          default: true
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Run tests
+        with:
+          command: cargo test
+          args: --all-features
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Cargo cache
+        with:
+          command: cache
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Install Rustup
+        with:
+          command: install-rustup
+          toolchain: nightly
+          components: clippy
+          default: true
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Clippy (default features)
+        with:
+          command: cargo clippy
+          args: --all-targets
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Clippy (all features)
+        with:
+          command: cargo clippy
+          args: --all-targets --all-features
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Install Rustup
+        with:
+          command: install-rustup
+          toolchain: nightly
+          components: rustfmt
+          default: true
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  check-licenses:
+    name: Check licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Cargo cache
+        with:
+          command: cache
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Install Rustup
+        with:
+          command: install-rustup
+          toolchain: stable
+          profile: minimal
+          default: true
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Install cargo-about
+        with:
+          command: cargo install
+          args: cargo-about --locked --features cli
+      - name: Check third-party licenses
+        run: cargo about generate -c ./.about/config.toml ./.about/template.hbs
