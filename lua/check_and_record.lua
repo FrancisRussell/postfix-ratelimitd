@@ -41,15 +41,26 @@ end
 
 -- Fetch and parse each key's buckets once, even if multiple windows share it.
 -- buckets_by_key[i] is an array of { id = <bucket id>, count = <recipients
--- recorded in that bucket> }, one per field in KEYS[i]'s hash.
+-- recorded in that bucket> }, one per field in KEYS[i]'s hash. min_id_by_key[i]
+-- is the oldest (smallest) bucket id present, nil if the key has none -
+-- staleness only gets less likely as id grows, so if even the oldest entry
+-- isn't stale relative to a cutoff, nothing else can be either. Used below to
+-- skip the prune scan on keys with nothing to prune, without scanning twice.
 local buckets_by_key = {}
+local min_id_by_key = {}
 for i = 1, num_keys do
     local fields = redis.call('HGETALL', KEYS[i])
     local buckets = {}
+    local min_id = nil
     for j = 1, #fields, 2 do
-        buckets[#buckets + 1] = { id = tonumber(fields[j]), count = tonumber(fields[j + 1]) }
+        local id = tonumber(fields[j])
+        buckets[#buckets + 1] = { id = id, count = tonumber(fields[j + 1]) }
+        if min_id == nil or id < min_id then
+            min_id = id
+        end
     end
     buckets_by_key[i] = buckets
+    min_id_by_key[i] = min_id
 end
 
 -- Check every window before recording anything: if a later window rejects,
@@ -85,13 +96,14 @@ for i = 1, num_keys do
     redis.call('EXPIRE', KEYS[i], plan.retention_secs[i])
 
     local oldest = now - plan.retention_secs[i]
-    local stale = {}
-    for _, entry in ipairs(buckets_by_key[i]) do
-        if (entry.id + 1) * bucket_size <= oldest then
-            stale[#stale + 1] = entry.id
+    local min_id = min_id_by_key[i]
+    if min_id ~= nil and (min_id + 1) * bucket_size <= oldest then
+        local stale = {}
+        for _, entry in ipairs(buckets_by_key[i]) do
+            if (entry.id + 1) * bucket_size <= oldest then
+                stale[#stale + 1] = entry.id
+            end
         end
-    end
-    if #stale > 0 then
         redis.call('HDEL', KEYS[i], unpack(stale))
     end
 end
