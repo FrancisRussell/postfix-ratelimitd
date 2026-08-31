@@ -67,7 +67,7 @@ const REQUIRED_COMMANDS: &[&str] = &["EVALSHA", "SCRIPT", "HGETALL", "HINCRBY", 
 /// an incompatible server is refused loudly here - once per connection, at
 /// startup or reload (see `Limiter::new`, which passes [`REQUIRED_COMMANDS`])
 /// - rather than only surfacing as a script error on the first real check.
-async fn check_command_support(connection: &mut ConnectionManager, commands: &[&str]) -> redis::RedisResult<()> {
+pub async fn check_command_support(connection: &mut ConnectionManager, commands: &[&str]) -> redis::RedisResult<()> {
     let info: Vec<redis::Value> = redis::cmd("COMMAND").arg("INFO").arg(commands).query_async(connection).await?;
     let missing: Vec<&str> = commands
         .iter()

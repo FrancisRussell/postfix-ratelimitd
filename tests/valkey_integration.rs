@@ -326,6 +326,23 @@ impl Drop for Daemon {
     }
 }
 
+// The one test here that calls into the library directly rather than through
+// the compiled daemon binary - check_command_support has no wire-protocol
+// surface of its own to drive from outside, so this is the only way to prove
+// a made-up command name is actually detected as missing, rather than trusting
+// that by inspection.
+#[tokio::test]
+async fn check_command_support_reports_missing_commands() {
+    const FAKE_COMMAND: &str = "DEFINITELY_NOT_A_REAL_COMMAND";
+    let valkey = ValkeyInstance::start_unix();
+    let client = redis::Client::open(valkey.redis_url()).expect("valid redis url");
+    let mut connection_manager = client.get_connection_manager().await.expect("connect to valkey");
+    let err = postfix_ratelimitd::limiter::check_command_support(&mut connection_manager, &["HGETALL", FAKE_COMMAND])
+        .await
+        .expect_err("a made-up command name should be reported as missing");
+    assert!(err.to_string().contains(FAKE_COMMAND));
+}
+
 #[test]
 fn successful_check_writes_a_real_key() {
     let valkey = ValkeyInstance::start_unix();
