@@ -1,5 +1,7 @@
 # postfix-ratelimitd
 
+[![CI](https://github.com/FrancisRussell/postfix-ratelimitd/actions/workflows/ci.yml/badge.svg)](https://github.com/FrancisRussell/postfix-ratelimitd/actions/workflows/ci.yml)
+
 A Postfix SMTP access policy daemon that rate-limits recipients per SASL
 username within a sliding time window, backed by Valkey/Redis.
 
