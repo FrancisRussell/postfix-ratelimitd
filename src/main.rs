@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -82,14 +84,14 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the periodic stats line (see `report_stats`) is printed.
-const STATS_INTERVAL: Duration = Duration::from_secs(60);
+const STATS_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Counts of what's happened since the last periodic stats line - see
 /// `report_stats`, which resets every field to 0 each time it reports them.
 /// `active_connections` isn't here since it's a live gauge, not something to
 /// accumulate - `report_stats` reads `ACTIVE_CONNECTIONS` directly instead.
-/// `misconfigured` isn't printed either - a wrong protocol_state or missing
-/// recipient_count should never happen in a working deployment, so it exists
+/// `misconfigured` isn't printed either - a wrong `protocol_state` or missing
+/// `recipient_count` should never happen in a working deployment, so it exists
 /// only to gate `log_throttled` for those two, not as a rate worth reporting.
 #[derive(Debug)]
 struct Stats {
@@ -388,6 +390,7 @@ async fn reload_config(path: &std::path::Path, config: &ArcSwap<Config>, limiter
 
 /// Loads the config, binds the policy socket, and serves connections until
 /// killed.
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() {
     // Refuses to run at all unless explicitly acknowledged - see

@@ -51,7 +51,7 @@ struct CheckRequest<'a> {
 /// separator) guarantees two different `(sasl_username, bucket_size)` pairs
 /// never produce the same key: the last unescaped `:` unambiguously marks
 /// where `bucket_size` starts. Without this, `sasl_username` "alice:64"
-/// would collide with username "alice" at bucket_size 64.
+/// would collide with username "alice" at `bucket_size` 64.
 fn bucket_key(key_prefix: &str, sasl_username: &str, bucket_size: u64) -> String {
     let escaped = sasl_username.replace('\\', "\\\\").replace(':', "\\:");
     format!("{key_prefix}{escaped}:{bucket_size}")
@@ -92,6 +92,7 @@ impl Limiter {
     /// caching separately. `now_override` should only ever be `Some` from a
     /// request under the integration-tests feature - see
     /// `Request::now_override`.
+    #[allow(clippy::missing_panics_doc)] // the only panic is an internal invariant, not a caller-facing condition
     pub async fn check(
         &self, sasl_username: &str, recipient_count: u32, plan: &CheckPlan, now_override: Option<u64>,
     ) -> redis::RedisResult<bool> {

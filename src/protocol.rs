@@ -54,11 +54,13 @@ impl Request {
     /// Postfix sends `sasl_username=` (present but empty) rather than omitting
     /// the attribute for unauthenticated sessions, so an empty value - and,
     /// trimming first, a whitespace-only one - is treated as absent.
+    #[must_use]
     pub fn sasl_username(&self) -> Option<&str> {
         self.attributes.get("sasl_username").map(|s| s.trim()).filter(|s| !s.is_empty())
     }
 
     /// The message's final recipient count, sent at the DATA stage.
+    #[must_use]
     pub fn recipient_count(&self) -> Option<u32> { self.attributes.get("recipient_count")?.parse().ok() }
 
     /// The restriction class this request was sent from, e.g. "DATA" or "RCPT".
@@ -69,6 +71,7 @@ impl Request {
     /// only compiled in under the integration-tests feature. Callers don't
     /// need to know which build this is: outside that feature this always
     /// returns `None`, regardless of what a client actually sent.
+    #[must_use]
     pub fn now_override(&self) -> Option<u64> {
         #[cfg(feature = "integration-tests")]
         {

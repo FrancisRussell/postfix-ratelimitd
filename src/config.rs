@@ -55,7 +55,7 @@ fn default_key_prefix() -> String { "postfix-ratelimitd:".to_string() }
 /// SMTP abuse, which is caught by hourly/daily thresholds instead), and
 /// comfortably above the point where `BUCKET_TARGET_COUNT` needs no help from
 /// clamping to `MIN_BUCKET_SIZE`.
-const MIN_WINDOW_DURATION: Duration = Duration::from_secs(60);
+const MIN_WINDOW_DURATION: Duration = Duration::from_mins(1);
 
 /// The longest window duration accepted - the longest possible calendar
 /// month.
@@ -167,14 +167,11 @@ impl CheckPlan {
         let mut planned_windows: Vec<PlannedWindow> = Vec::new();
         for window in windows {
             let size = bucket_size(window.duration).as_secs();
-            let key_index = match bucket_sizes.iter().position(|&existing| existing == size) {
-                Some(index) => index,
-                None => {
-                    bucket_sizes.push(size);
-                    retention_secs.push(0);
-                    bucket_sizes.len() - 1
-                }
-            };
+            let key_index = bucket_sizes.iter().position(|&existing| existing == size).unwrap_or_else(|| {
+                bucket_sizes.push(size);
+                retention_secs.push(0);
+                bucket_sizes.len() - 1
+            });
             let span_secs = lookback_buckets(window.duration) * size;
             retention_secs[key_index] = retention_secs[key_index].max(span_secs);
 
@@ -307,6 +304,7 @@ fn validate_windows(index: usize, windows: &[Window]) -> Result<(), ConfigError>
 
 impl Config {
     /// Reads, parses, and validates the config file at `path`.
+    #[allow(clippy::missing_panics_doc)] // the only panic is an internal invariant, not a caller-facing condition
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         let text =
             std::fs::read_to_string(path).map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
@@ -364,8 +362,9 @@ impl Config {
 
     /// Returns the plan to enforce for `sasl_username`: the first matching
     /// rule's, or the default plan if nothing else matches.
+    #[must_use]
     pub fn plan_for(&self, sasl_username: &str) -> &CheckPlan {
-        self.limits.iter().find(|rule| rule.matches(sasl_username)).map(|rule| &rule.plan).unwrap_or(&self.default_plan)
+        self.limits.iter().find(|rule| rule.matches(sasl_username)).map_or(&self.default_plan, |rule| &rule.plan)
     }
 }
 
@@ -562,8 +561,8 @@ mod tests {
         // bucket_size/lookback_buckets functions rather than hardcoded, so
         // this keeps testing the same property under any legitimate retuning
         // of BUCKET_TARGET_COUNT or the bucket-size ladder.
-        let short = Duration::from_secs(3600);
-        let long = Duration::from_secs(4200);
+        let short = Duration::from_hours(1);
+        let long = Duration::from_mins(70);
         assert_eq!(bucket_size(short), bucket_size(long), "test premise: both durations should share a bucket size");
 
         let toml = default_config(vec![window(1, "3600s"), window(1, "4200s")]);

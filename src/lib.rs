@@ -3,6 +3,9 @@
 //! library so both it and this crate's integration tests share one
 //! compilation of them rather than the binary having its own private copy.
 
+#![warn(clippy::pedantic)]
+#![allow(clippy::missing_errors_doc)]
+
 pub mod config;
 pub mod limiter;
 pub mod protocol;
