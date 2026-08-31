@@ -287,6 +287,7 @@ impl Daemon {
     fn raw_request(&self, request: &str) -> String {
         let stream = UnixStream::connect(&self.socket).expect("connect to daemon");
         (&stream).write_all(request.as_bytes()).expect("write request");
+        (&stream).flush().expect("flush request");
 
         let mut reader = BufReader::new(&stream);
         let mut response = String::new();
