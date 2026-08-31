@@ -627,8 +627,8 @@ fn a_week_long_window_expires_via_the_real_check_and_record_logic() {
 #[test]
 fn window_lifecycle_at_the_minimum_duration_extreme() {
     let valkey = ValkeyInstance::start_unix();
-    // 60s is MIN_WINDOW_DURATION; it lands on a 2s bucket size with a span_secs
-    // of exactly 60s (see
+    // 60s is MIN_WINDOW_DURATION; it lands on MIN_BUCKET_SIZE (1s) with a
+    // span_secs of exactly 60s (see
     // config::tests::bucket_size_hits_target_count_at_min_window_duration).
     let config = "redis.key_prefix = \"rl:\"\n\
                   [[limits]]\n\
@@ -654,9 +654,10 @@ fn window_lifecycle_at_the_minimum_duration_extreme() {
 #[test]
 fn window_lifecycle_at_the_maximum_duration_extreme() {
     let valkey = ValkeyInstance::start_unix();
-    // 31d is MAX_WINDOW_DURATION; it clamps to MAX_BUCKET_SIZE (65536s), giving
-    // a span_secs of 2,686,976s (~31.09d, not the nominal 2,678,400s) - see
-    // config::tests::bucket_size_is_clamped_to_max_at_max_window_duration.
+    // 31d is MAX_WINDOW_DURATION; it lands on a 32768s bucket (not yet
+    // MAX_BUCKET_SIZE's clamp - see its own doc comment), giving a span_secs
+    // of 2,686,976s (~31.09d, not the nominal 2,678,400s) - see
+    // config::tests::bucket_size_at_max_window_duration_does_not_yet_reach_the_clamp.
     let config = "redis.key_prefix = \"rl:\"\n\
                   [[limits]]\n\
                   type = \"default\"\n\
@@ -682,30 +683,31 @@ fn window_lifecycle_at_the_maximum_duration_extreme() {
 #[test]
 fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
     let valkey = ValkeyInstance::start_unix();
-    // A 16d and a 31d window both clamp to MAX_BUCKET_SIZE (65536s) and so
-    // share one Redis key, but their own spans differ (~16.68d vs ~31.09d) -
-    // the shared key's retention (and prune cutoff) is the longer of the two,
-    // so an entry can correctly stop counting against the 16d window's own
-    // limit long before it's actually deleted.
+    // A 19d and a 31d window both land on a 32768s bucket (see
+    // window_lifecycle_at_the_maximum_duration_extreme) and so share one
+    // Redis key, but their own spans differ (~19.34d vs ~31.09d) - the shared
+    // key's retention (and prune cutoff) is the longer of the two, so an
+    // entry can correctly stop counting against the 19d window's own limit
+    // long before it's actually deleted.
     let config = "redis.key_prefix = \"rl:\"\n\
                   [[limits]]\n\
                   type = \"default\"\n\
-                  windows = [ { count = 1, duration = \"16d\" }, { count = 5, duration = \"31d\" } ]\n";
+                  windows = [ { count = 1, duration = \"19d\" }, { count = 5, duration = \"31d\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
 
     let daemon = Daemon::start(&valkey, config);
     let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit both empty windows");
 
-    // 20 days later: past the 16d window's own ~16.68d span, but well before
-    // the shared key's ~31.09d retention. If the 16d window incorrectly used
+    // 25 days later: past the 19d window's own ~19.34d span, but well before
+    // the shared key's ~31.09d retention. If the 19d window incorrectly used
     // the shared key's longer retention as its own cutoff instead of its own
     // span, this message would push its count-1 limit to 2 and be rejected.
-    let response = daemon.request_at("alice", 1, base_now + 20 * 24 * 60 * 60);
+    let response = daemon.request_at("alice", 1, base_now + 25 * 24 * 60 * 60);
     assert_eq!(
         response,
         format!("action={ACTION_DUNNO}\n\n"),
-        "the 16d window should have already stopped counting the 20-day-old message"
+        "the 19d window should have already stopped counting the 25-day-old message"
     );
 
     // Both windows should indeed share one key - the premise this test's name
@@ -713,14 +715,14 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
     // computation makes this fail loudly instead of silently checking a key
     // the daemon never touches.
     let keys = valkey.keys("rl:alice:*");
-    assert_eq!(keys.len(), 1, "the 16d and 31d windows should share one key");
+    assert_eq!(keys.len(), 1, "the 19d and 31d windows should share one key");
 
-    // The 20-day-old entry must still be physically present, though - it's
-    // excluded from the 16d window's own sum, not yet pruned from the shared
+    // The 25-day-old entry must still be physically present, though - it's
+    // excluded from the 19d window's own sum, not yet pruned from the shared
     // key, since the key's retention is the 31d window's longer span.
     let mut connection = valkey.connection();
     let fields: Vec<String> = redis::cmd("HKEYS").arg(&keys[0]).query(&mut connection).expect("hkeys");
-    assert_eq!(fields.len(), 2, "the 20-day-old entry should still be present (not yet pruned), alongside the new one");
+    assert_eq!(fields.len(), 2, "the 25-day-old entry should still be present (not yet pruned), alongside the new one");
 }
 
 #[test]
@@ -746,8 +748,8 @@ fn multi_window_rule_ages_out_each_window_independently() {
     let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"), "the hourly cap should already be full");
 
-    // 2 hours later: past the hourly window's own span (~62 minutes), but
-    // nowhere near the daily window's (~25 hours) - the hourly window should
+    // 2 hours later: past the hourly window's own span (~61 minutes), but
+    // nowhere near the daily window's (~24 hours) - the hourly window should
     // have reset while the daily total (still counting the 2-hour-old
     // message) is exactly full at 21/21.
     let two_hours_later = base_now + 2 * 60 * 60;

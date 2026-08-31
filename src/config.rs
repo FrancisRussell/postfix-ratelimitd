@@ -65,9 +65,9 @@ const MAX_WINDOW_DURATION: Duration = Duration::from_hours(31 * 24);
 /// message (see `check_and_record.lua`). This is the number of buckets a
 /// window is aggregated into, for any window whose resulting bucket size
 /// doesn't need clamping to `MIN_BUCKET_SIZE` or `MAX_BUCKET_SIZE` - giving a
-/// target overcount of `1/BUCKET_TARGET_COUNT` (5%) of the window's own
+/// target overcount of `1/BUCKET_TARGET_COUNT` (2%) of the window's own
 /// duration.
-pub const BUCKET_TARGET_COUNT: u64 = 20;
+pub const BUCKET_TARGET_COUNT: u64 = 50;
 
 /// The smallest bucket size ever used, regardless of what
 /// `BUCKET_TARGET_COUNT` would otherwise compute for a very short window.
@@ -75,9 +75,18 @@ const MIN_BUCKET_SIZE: Duration = Duration::from_secs(1);
 
 /// The largest bucket size ever used, regardless of what
 /// `BUCKET_TARGET_COUNT` would otherwise compute for a very long window - a
-/// power of two, like every other bucket size, so it's a ladder rung rather
-/// than a special case.
-const MAX_BUCKET_SIZE: Duration = Duration::from_secs(65536);
+/// day. Doesn't need to itself be a power of two: `bucket_size` only ever
+/// compares a candidate doubling (always a power of two) against this value,
+/// so whatever clears that comparison is already the largest power of two not
+/// exceeding it, with no separate rounding step needed. Chosen independently
+/// of `BUCKET_TARGET_COUNT` and `MAX_WINDOW_DURATION` rather than derived
+/// from them, so it doesn't need retuning whenever either of those does; a
+/// window needs to be at least `BUCKET_TARGET_COUNT * MAX_BUCKET_SIZE` long
+/// to ever reach this clamp, which at the current `BUCKET_TARGET_COUNT` is
+/// longer than `MAX_WINDOW_DURATION` allows - this is currently unreachable,
+/// not dead: raising either constant later can make it live again without
+/// any change here.
+const MAX_BUCKET_SIZE: Duration = Duration::from_hours(24);
 
 /// Selects the Redis hash bucket size to aggregate a window's messages into:
 /// the largest power-of-two multiple of `MIN_BUCKET_SIZE`, up to
@@ -460,14 +469,21 @@ mod tests {
 
     #[test]
     fn bucket_size_hits_target_count_at_min_window_duration() {
-        assert_eq!(bucket_size(MIN_WINDOW_DURATION), Duration::from_secs(2));
-        assert_eq!(lookback_buckets(MIN_WINDOW_DURATION), 30);
+        assert_eq!(bucket_size(MIN_WINDOW_DURATION), MIN_BUCKET_SIZE);
+        assert_eq!(lookback_buckets(MIN_WINDOW_DURATION), 60);
     }
 
     #[test]
-    fn bucket_size_is_clamped_to_max_at_max_window_duration() {
-        assert_eq!(bucket_size(MAX_WINDOW_DURATION), MAX_BUCKET_SIZE);
-        assert_eq!(lookback_buckets(MAX_WINDOW_DURATION), 41);
+    fn bucket_size_at_max_window_duration_does_not_yet_reach_the_clamp() {
+        // At the current BUCKET_TARGET_COUNT, a window needs to be longer than
+        // MAX_WINDOW_DURATION allows to ever reach MAX_BUCKET_SIZE's clamp
+        // (see its own doc comment) - 32768s, not 65536s (the largest power of
+        // two MAX_BUCKET_SIZE, a day, would round down to), is the actual
+        // ceiling reached here. Pinned so a change to either constant that
+        // makes 65536s reachable again is a deliberate, visible decision, not
+        // a silent side effect.
+        assert_eq!(bucket_size(MAX_WINDOW_DURATION), Duration::from_secs(32768));
+        assert_eq!(lookback_buckets(MAX_WINDOW_DURATION), 82);
     }
 
     #[test]
@@ -477,7 +493,7 @@ mod tests {
         // boundary: at least BUCKET_TARGET_COUNT buckets, and a retained span (rounding
         // duration up to a whole number of buckets, since a partially-elapsed boundary
         // bucket always counts in full) that overcounts by no more than
-        // 1/BUCKET_TARGET_COUNT (5%) of the window's own duration. Exhaustive over
+        // 1/BUCKET_TARGET_COUNT (2%) of the window's own duration. Exhaustive over
         // every second in the valid range rather than sampled, since it's cheap
         // enough (milliseconds) not to need to be.
         let mut duration = MIN_WINDOW_DURATION;
