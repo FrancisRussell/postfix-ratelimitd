@@ -14,7 +14,7 @@ username within a sliding time window, backed by Valkey/Redis.
 # "rediss://" scheme, verified against the system's trusted CAs.
 url = "redis://127.0.0.1:6379"
 db = 1
-key_prefix = "postfix-ratelimitd:"
+key_prefix = "postfix-ratelimitd"
 
 # Optional; read as the connection password. Error if url also embeds one
 # (e.g. "redis://:secret@host") - supply it only one way.

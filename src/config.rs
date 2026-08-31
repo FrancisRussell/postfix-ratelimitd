@@ -48,7 +48,7 @@ impl LimitRule {
 }
 
 /// The default value of `redis_key_prefix` when the config file omits it.
-fn default_key_prefix() -> String { "postfix-ratelimitd:".to_string() }
+fn default_key_prefix() -> String { "postfix-ratelimitd".to_string() }
 
 /// The shortest window duration accepted. Chosen for sanity as an anti-abuse
 /// email rate limit (sub-minute windows suit burst API protection more than

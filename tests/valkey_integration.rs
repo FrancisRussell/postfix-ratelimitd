@@ -348,7 +348,7 @@ fn successful_check_writes_a_real_key() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(
         &valkey,
-        "redis.key_prefix = \"rl:\"\n\
+        "redis.key_prefix = \"rl\"\n\
          [[limits]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
@@ -357,7 +357,7 @@ fn successful_check_writes_a_real_key() {
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
-    let keys = valkey.keys("rl:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:alice:*");
     assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
     let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
@@ -370,7 +370,7 @@ fn wrong_protocol_state_defers_without_checking() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(
         &valkey,
-        "redis.key_prefix = \"rl:\"\n\
+        "redis.key_prefix = \"rl\"\n\
          [[limits]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
@@ -384,7 +384,10 @@ fn wrong_protocol_state_defers_without_checking() {
 
     // Never reached the rate-limit check at all, so nothing should be recorded -
     // under any key, not just the one this window's own bucket size would use.
-    assert!(valkey.keys("rl:alice:*").is_empty(), "a misconfigured-protocol-state request must not be recorded");
+    assert!(
+        valkey.keys("rl:bucket:v1:alice:*").is_empty(),
+        "a misconfigured-protocol-state request must not be recorded"
+    );
 }
 
 #[test]
@@ -392,7 +395,7 @@ fn missing_recipient_count_defers_without_checking() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(
         &valkey,
-        "redis.key_prefix = \"rl:\"\n\
+        "redis.key_prefix = \"rl\"\n\
          [[limits]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
@@ -403,7 +406,7 @@ fn missing_recipient_count_defers_without_checking() {
     let response = daemon.raw_request("sasl_username=alice\nprotocol_state=DATA\n\n");
     assert_eq!(response, format!("action={ACTION_MISCONFIGURED}\n\n"));
 
-    assert!(valkey.keys("rl:alice:*").is_empty(), "a misconfigured request must not be recorded");
+    assert!(valkey.keys("rl:bucket:v1:alice:*").is_empty(), "a misconfigured request must not be recorded");
 }
 
 #[test]
@@ -411,7 +414,7 @@ fn unauthenticated_request_permitted_by_default() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(
         &valkey,
-        "redis.key_prefix = \"rl:\"\n\
+        "redis.key_prefix = \"rl\"\n\
          [[limits]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
@@ -427,7 +430,7 @@ fn unauthenticated_request_still_permitted_with_warning_silenced() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(
         &valkey,
-        "redis.key_prefix = \"rl:\"\n\
+        "redis.key_prefix = \"rl\"\n\
          server.warn_on_unauthenticated = false\n\
          [[limits]]\n\
          type = \"default\"\n\
@@ -481,7 +484,7 @@ fn successful_check_over_tcp() {
     let valkey = ValkeyInstance::start_tcp();
     let daemon = Daemon::start(
         &valkey,
-        "redis.key_prefix = \"rl:\"\n\
+        "redis.key_prefix = \"rl\"\n\
          [[limits]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
@@ -490,7 +493,7 @@ fn successful_check_over_tcp() {
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
-    let keys = valkey.keys("rl:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:alice:*");
     assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
     let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
@@ -502,7 +505,7 @@ fn rate_limit_exceeded_defers_and_does_not_record() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(
         &valkey,
-        "redis.key_prefix = \"rl:\"\n\
+        "redis.key_prefix = \"rl\"\n\
          [[limits]]\n\
          type = \"default\"\n\
          windows = [ { count = 2, duration = \"1h\" } ]\n",
@@ -517,7 +520,7 @@ fn rate_limit_exceeded_defers_and_does_not_record() {
     assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"));
 
     // The rejected message must not have been recorded alongside the accepted one.
-    let keys = valkey.keys("rl:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:alice:*");
     assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
     let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
@@ -530,7 +533,7 @@ fn exceeding_either_window_defers_and_accepted_records_in_both() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(
         &valkey,
-        "redis.key_prefix = \"rl:\"\n\
+        "redis.key_prefix = \"rl\"\n\
          [[limits]]\n\
          type = \"default\"\n\
          windows = [ { count = 100, duration = \"1h\" }, { count = 2, duration = \"1d\" } ]\n",
@@ -540,7 +543,7 @@ fn exceeding_either_window_defers_and_accepted_records_in_both() {
     // rejected.
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"));
-    assert!(valkey.keys("rl:alice:*").is_empty(), "rejected message must not be recorded in any window");
+    assert!(valkey.keys("rl:bucket:v1:alice:*").is_empty(), "rejected message must not be recorded in any window");
 
     // Fits both windows: accepted and recorded in both. The 1h and 1d windows
     // land on different bucket sizes, so each gets its own key - discovered
@@ -549,7 +552,7 @@ fn exceeding_either_window_defers_and_accepted_records_in_both() {
     let response = daemon.request("alice", 2);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
-    let keys = valkey.keys("rl:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:alice:*");
     assert_eq!(keys.len(), 2, "the hourly and daily windows should each get their own key");
     let mut connection = valkey.connection();
     for key in &keys {
@@ -563,7 +566,7 @@ fn expired_entries_stop_counting_against_the_limit() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(
         &valkey,
-        "redis.key_prefix = \"rl:\"\n\
+        "redis.key_prefix = \"rl\"\n\
          [[limits]]\n\
          type = \"default\"\n\
          windows = [ { count = 1, duration = \"60s\" } ]\n",
@@ -576,7 +579,7 @@ fn expired_entries_stop_counting_against_the_limit() {
     // checking) a key the daemon never touches.
     let probe_response = daemon.request("probe", 1);
     assert_eq!(probe_response, format!("action={ACTION_DUNNO}\n\n"), "probe message should be accepted");
-    let probe_keys = valkey.keys("rl:probe:*");
+    let probe_keys = valkey.keys("rl:bucket:v1:probe:*");
     assert_eq!(probe_keys.len(), 1, "expected exactly one key for the probe window");
     let bucket_size: u64 = probe_keys[0]
         .rsplit(':')
@@ -584,7 +587,7 @@ fn expired_entries_stop_counting_against_the_limit() {
         .expect("key has a bucket-size suffix")
         .parse()
         .expect("bucket size is numeric");
-    let key = format!("rl:alice:{bucket_size}");
+    let key = format!("rl:bucket:v1:alice:{bucket_size}");
 
     // Seed a bucket far outside the window's lookback, as if a message had
     // been recorded and then aged out - real time never needs to pass for
@@ -607,7 +610,7 @@ fn expired_entries_stop_counting_against_the_limit() {
 #[test]
 fn a_week_long_window_expires_via_the_real_check_and_record_logic() {
     let valkey = ValkeyInstance::start_unix();
-    let config = "redis.key_prefix = \"rl:\"\n\
+    let config = "redis.key_prefix = \"rl\"\n\
                   [[limits]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"7d\" } ]\n";
@@ -647,7 +650,7 @@ fn window_lifecycle_at_the_minimum_duration_extreme() {
     // 60s is MIN_WINDOW_DURATION; it lands on MIN_BUCKET_SIZE (1s) with a
     // span_secs of exactly 60s (see
     // config::tests::bucket_size_hits_target_count_at_min_window_duration).
-    let config = "redis.key_prefix = \"rl:\"\n\
+    let config = "redis.key_prefix = \"rl\"\n\
                   [[limits]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"60s\" } ]\n";
@@ -675,7 +678,7 @@ fn window_lifecycle_at_the_maximum_duration_extreme() {
     // MAX_BUCKET_SIZE's clamp - see its own doc comment), giving a span_secs
     // of 2,686,976s (~31.09d, not the nominal 2,678,400s) - see
     // config::tests::bucket_size_at_max_window_duration_does_not_yet_reach_the_clamp.
-    let config = "redis.key_prefix = \"rl:\"\n\
+    let config = "redis.key_prefix = \"rl\"\n\
                   [[limits]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"31d\" } ]\n";
@@ -706,7 +709,7 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
     // key's retention (and prune cutoff) is the longer of the two, so an
     // entry can correctly stop counting against the 19d window's own limit
     // long before it's actually deleted.
-    let config = "redis.key_prefix = \"rl:\"\n\
+    let config = "redis.key_prefix = \"rl\"\n\
                   [[limits]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"19d\" }, { count = 5, duration = \"31d\" } ]\n";
@@ -731,7 +734,7 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
     // rests on - discovered rather than assumed, so a change to the bucket-size
     // computation makes this fail loudly instead of silently checking a key
     // the daemon never touches.
-    let keys = valkey.keys("rl:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:alice:*");
     assert_eq!(keys.len(), 1, "the 19d and 31d windows should share one key");
 
     // The 25-day-old entry must still be physically present, though - it's
@@ -751,7 +754,7 @@ fn multi_window_rule_ages_out_each_window_independently() {
     // key - each window keeps its own key and ages out fully independently.
     // The daily cap (21) is deliberately tight, not generous like the hourly
     // one - see the last stage below, which depends on it.
-    let config = "redis.key_prefix = \"rl:\"\n\
+    let config = "redis.key_prefix = \"rl\"\n\
                   [[limits]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 20, duration = \"1h\" }, { count = 21, duration = \"1d\" } ]\n";
@@ -796,7 +799,7 @@ fn overcount_bound_holds_against_real_recorded_data() {
     // size or span - computed from the real constant so this can't silently
     // drift out of sync with it, unlike asserting a specific span value would.
     let duration_secs = 3600u64;
-    let config = "redis.key_prefix = \"rl:\"\n\
+    let config = "redis.key_prefix = \"rl\"\n\
                   [[limits]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"3600s\" } ]\n";
@@ -838,7 +841,7 @@ fn tls_connection_to_valkey_with_custom_ca() {
     let ca_cert = valkey.tls_ca_cert().to_str().expect("fixture CA path is valid UTF-8");
     let daemon = Daemon::start_with_env(
         &valkey,
-        "redis.key_prefix = \"rl:\"\n\
+        "redis.key_prefix = \"rl\"\n\
          [[limits]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
@@ -849,7 +852,7 @@ fn tls_connection_to_valkey_with_custom_ca() {
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
     // Confirms the check actually went through the TLS-only server, not a fallback.
-    let keys = valkey.keys("rl:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:alice:*");
     assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
     let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::time::Duration;
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -42,6 +43,30 @@ struct CheckRequest<'a> {
     plan: CheckPlanFields<'a>,
 }
 
+/// Identifies a key as a per-user rate-limit bucket hash, distinguishing it
+/// from any other kind of key that might one day share `key_prefix`.
+const BUCKET_KEY_TYPE: &str = "bucket";
+
+/// This key type's schema version - independent of any other key type's, so
+/// introducing or revising one doesn't force bumping (and so orphaning) keys
+/// of another. Bump this if a future change to `bucket_key`'s format or the
+/// meaning of a bucket hash's fields could otherwise make old-format data
+/// misread as valid under new code; a key-shape change alone doesn't need
+/// this, since it already can't collide with the shape it replaces.
+const BUCKET_SCHEMA_VERSION: &str = "v1";
+
+/// Escapes `\` and `:` in `sasl_username` so it can't be mistaken for
+/// anything else once joined into a bucket key - see `bucket_key`. Borrows
+/// the input unchanged when nothing needs escaping, which is the common case
+/// for real usernames, rather than always allocating a new `String`.
+fn escape_username(sasl_username: &str) -> Cow<'_, str> {
+    if sasl_username.contains(['\\', ':']) {
+        Cow::Owned(sasl_username.replace('\\', "\\\\").replace(':', "\\:"))
+    } else {
+        Cow::Borrowed(sasl_username)
+    }
+}
+
 /// The Redis key for one `sasl_username`'s bucket at `bucket_size` - the only
 /// place a bucket key gets built, so escaping `sasl_username` here is enough
 /// to guarantee it everywhere.
@@ -53,8 +78,8 @@ struct CheckRequest<'a> {
 /// where `bucket_size` starts. Without this, `sasl_username` "alice:64"
 /// would collide with username "alice" at `bucket_size` 64.
 fn bucket_key(key_prefix: &str, sasl_username: &str, bucket_size: u64) -> String {
-    let escaped = sasl_username.replace('\\', "\\\\").replace(':', "\\:");
-    format!("{key_prefix}{escaped}:{bucket_size}")
+    let escaped = escape_username(sasl_username);
+    format!("{key_prefix}:{BUCKET_KEY_TYPE}:{BUCKET_SCHEMA_VERSION}:{escaped}:{bucket_size}")
 }
 
 /// Commands `check_and_record.lua` and `Script::invoke_async` depend on:
@@ -144,19 +169,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn escape_username_borrows_when_nothing_needs_escaping() {
+        assert!(matches!(escape_username("alice"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn escape_username_allocates_only_when_escaping_is_needed() {
+        assert!(matches!(escape_username("alice:64"), Cow::Owned(_)));
+        assert!(matches!(escape_username("alice\\"), Cow::Owned(_)));
+    }
+
+    #[test]
     fn bucket_key_does_not_collide_across_the_username_bucket_size_boundary() {
-        // Without escaping, both would produce "prefix:alice:64".
-        let a = bucket_key("prefix:", "alice:64", 1);
-        let b = bucket_key("prefix:", "alice", 64);
+        // Without escaping, both would produce "prefix:bucket:v1:alice:64".
+        let a = bucket_key("prefix", "alice:64", 1);
+        let b = bucket_key("prefix", "alice", 64);
         assert_ne!(a, b);
     }
 
     #[test]
     fn bucket_key_does_not_collide_when_a_username_ends_in_a_backslash() {
         // Without escaping the escape character itself, both would produce
-        // "prefix:alice\:64".
-        let a = bucket_key("prefix:", "alice\\", 64);
-        let b = bucket_key("prefix:", "alice", 64);
+        // "prefix:bucket:v1:alice\:64".
+        let a = bucket_key("prefix", "alice\\", 64);
+        let b = bucket_key("prefix", "alice", 64);
         assert_ne!(a, b);
     }
 }
