@@ -57,6 +57,31 @@ fn bucket_key(key_prefix: &str, sasl_username: &str, bucket_size: u64) -> String
     format!("{key_prefix}{escaped}:{bucket_size}")
 }
 
+/// Commands `check_and_record.lua` and `Script::invoke_async` depend on:
+/// `EVALSHA` and `SCRIPT` (the latter for `SCRIPT LOAD`, on a cache miss -
+/// `redis`'s `Script` never falls back to plain `EVAL`), and the script's own
+/// `HGETALL`/`HINCRBY`/`HDEL`/`EXPIRE`/`TIME` calls.
+const REQUIRED_COMMANDS: &[&str] = &["EVALSHA", "SCRIPT", "HGETALL", "HINCRBY", "HDEL", "EXPIRE", "TIME"];
+
+/// Confirms the connected server recognizes every command in `commands`, so
+/// an incompatible server is refused loudly here - once per connection, at
+/// startup or reload (see `Limiter::new`, which passes [`REQUIRED_COMMANDS`])
+/// - rather than only surfacing as a script error on the first real check.
+async fn check_command_support(connection: &mut ConnectionManager, commands: &[&str]) -> redis::RedisResult<()> {
+    let info: Vec<redis::Value> = redis::cmd("COMMAND").arg("INFO").arg(commands).query_async(connection).await?;
+    let missing: Vec<&str> = commands
+        .iter()
+        .zip(&info)
+        .filter(|(_, info)| matches!(info, redis::Value::Nil))
+        .map(|(&name, _)| name)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err((redis::ErrorKind::Client, "server is missing required commands", missing.join(", ")).into())
+    }
+}
+
 /// Checks and records recipient counts against Valkey via
 /// `check_and_record.lua`.
 #[derive(Clone)]
@@ -76,7 +101,8 @@ impl Limiter {
             .set_response_timeout(Some(RESPONSE_TIMEOUT))
             .set_number_of_retries(CONNECTION_RETRIES)
             .set_max_delay(CONNECTION_RETRY_MAX_DELAY);
-        let connection_manager = client.get_connection_manager_with_config(manager_config).await?;
+        let mut connection_manager = client.get_connection_manager_with_config(manager_config).await?;
+        check_command_support(&mut connection_manager, REQUIRED_COMMANDS).await?;
         Ok(Limiter { connection_manager, key_prefix, script: Script::new(CHECK_AND_RECORD) })
     }
 
