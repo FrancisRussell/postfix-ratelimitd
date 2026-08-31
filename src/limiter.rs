@@ -42,6 +42,21 @@ struct CheckRequest<'a> {
     plan: CheckPlanFields<'a>,
 }
 
+/// The Redis key for one `sasl_username`'s bucket at `bucket_size` - the only
+/// place a bucket key gets built, so escaping `sasl_username` here is enough
+/// to guarantee it everywhere.
+///
+/// `bucket_size` is always plain decimal digits, so escaping `\` and `:` in
+/// `sasl_username` (backslash-escaping the escape character itself, then the
+/// separator) guarantees two different `(sasl_username, bucket_size)` pairs
+/// never produce the same key: the last unescaped `:` unambiguously marks
+/// where `bucket_size` starts. Without this, `sasl_username` "alice:64"
+/// would collide with username "alice" at bucket_size 64.
+fn bucket_key(key_prefix: &str, sasl_username: &str, bucket_size: u64) -> String {
+    let escaped = sasl_username.replace('\\', "\\\\").replace(':', "\\:");
+    format!("{key_prefix}{escaped}:{bucket_size}")
+}
+
 /// Checks and records recipient counts against Valkey via
 /// `check_and_record.lua`.
 #[derive(Clone)]
@@ -84,7 +99,7 @@ impl Limiter {
         let mut invocation = self.script.prepare_invoke();
 
         for &bucket_size in &plan.bucket_sizes {
-            invocation.key(format!("{}{}:{}", self.key_prefix, sasl_username, bucket_size));
+            invocation.key(bucket_key(&self.key_prefix, sasl_username, bucket_size));
         }
 
         let request = CheckRequest { recipient_count, now_override, plan: plan.fields() };
@@ -94,5 +109,27 @@ impl Limiter {
 
         let allowed: i64 = invocation.invoke_async(&mut connection).await?;
         Ok(allowed == 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_key_does_not_collide_across_the_username_bucket_size_boundary() {
+        // Without escaping, both would produce "prefix:alice:64".
+        let a = bucket_key("prefix:", "alice:64", 1);
+        let b = bucket_key("prefix:", "alice", 64);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn bucket_key_does_not_collide_when_a_username_ends_in_a_backslash() {
+        // Without escaping the escape character itself, both would produce
+        // "prefix:alice\:64".
+        let a = bucket_key("prefix:", "alice\\", 64);
+        let b = bucket_key("prefix:", "alice", 64);
+        assert_ne!(a, b);
     }
 }
