@@ -151,10 +151,16 @@ pub struct CheckPlan {
 impl CheckPlan {
     /// Builds a plan from a rule's windows - see the `CheckPlan` docs above.
     ///
-    /// Windows that end up sharing both `key_index` and `span_secs` are
-    /// checked against the exact same accumulated total, so only the
-    /// stricter (lower) of their limits can ever be the one that rejects -
-    /// the other is folded in rather than kept as a redundant entry.
+    /// Two windows are checked against the exact same accumulated total
+    /// exactly when both their `key_index` and `span_secs` match - neither
+    /// alone is enough, since different bucket sizes can add up to the same
+    /// span by coincidence, and windows sharing a bucket size can still need
+    /// different retentions. Same `duration` guarantees both match (they're
+    /// pure functions of it); different durations occasionally land on both
+    /// too, by rounding up to the same bucket size and span. Either way,
+    /// only the stricter (lower) of the matching limits can ever be the one
+    /// that rejects, so the other is folded in rather than kept as a
+    /// redundant entry.
     fn new(windows: &[Window]) -> CheckPlan {
         let mut bucket_sizes: Vec<u64> = Vec::new();
         let mut retention_secs: Vec<u64> = Vec::new();
@@ -369,111 +375,125 @@ mod tests {
 
     /// Writes `toml` to a temp file and loads it, mirroring real config file
     /// usage.
-    fn load(toml: &str) -> Result<Config, ConfigError> {
+    fn load(toml: impl std::fmt::Display) -> Result<Config, ConfigError> {
         let file = tempfile::NamedTempFile::new().expect("create temp file");
-        std::fs::write(file.path(), toml).expect("write temp file");
+        std::fs::write(file.path(), toml.to_string()).expect("write temp file");
         Config::load(file.path())
     }
 
-    const BASE: &str = "redis.url = \"redis://127.0.0.1:6379\"\nredis.db = 1\nserver.socket = \"/tmp/policy\"\n";
+    fn window(count: i64, duration: &str) -> toml::Value {
+        toml::Value::Table(toml::toml! {
+            count = count
+            duration = duration
+        })
+    }
+
+    /// A minimal valid config with a single `type = "default"` rule - the
+    /// shape most tests only need incidentally, to reach whatever validation
+    /// or behavior they're actually exercising.
+    fn default_config(windows: Vec<toml::Value>) -> toml::Table {
+        toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+
+            [[limits]]
+            type = "default"
+            windows = windows
+        }
+    }
 
     #[test]
     fn unknown_top_level_field_is_rejected() {
-        let toml = format!(
-            "{BASE}\n\
-             server.on_redis_eror = \"permit\"\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"1h\" }} ]\n"
-        );
-        assert!(matches!(load(&toml), Err(ConfigError::Parse { .. })));
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+            server.on_redis_eror = "permit"
+
+            [[limits]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
+        assert!(matches!(load(toml), Err(ConfigError::Parse { .. })));
     }
 
     #[test]
     fn zero_default_rules_is_rejected() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"username\"\n\
-             username = \"alice\"\n\
-             windows = [ {{ count = 1, duration = \"1h\" }} ]\n"
-        );
-        assert!(matches!(load(&toml), Err(ConfigError::DefaultCount { count: 0 })));
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+
+            [[limits]]
+            type = "username"
+            username = "alice"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
+        assert!(matches!(load(toml), Err(ConfigError::DefaultCount { count: 0 })));
     }
 
     #[test]
     fn multiple_default_rules_is_rejected() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"1h\" }} ]\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 2, duration = \"1h\" }} ]\n"
-        );
-        assert!(matches!(load(&toml), Err(ConfigError::DefaultCount { count: 2 })));
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+
+            [[limits]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+
+            [[limits]]
+            type = "default"
+            windows = [ { count = 2, duration = "1h" } ]
+        };
+        assert!(matches!(load(toml), Err(ConfigError::DefaultCount { count: 2 })));
     }
 
     #[test]
     fn default_rule_position_does_not_matter() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"1h\" }} ]\n\
-             [[limits]]\n\
-             type = \"username\"\n\
-             username = \"alice\"\n\
-             windows = [ {{ count = 2, duration = \"1h\" }} ]\n"
-        );
-        let config = load(&toml).expect("default rule need not be last");
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+
+            [[limits]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+
+            [[limits]]
+            type = "username"
+            username = "alice"
+            windows = [ { count = 2, duration = "1h" } ]
+        };
+        let config = load(toml).expect("default rule need not be last");
         assert_eq!(config.plan_for("alice").windows[0].limit, 2);
         assert_eq!(config.plan_for("bob").windows[0].limit, 1);
     }
 
     #[test]
     fn subsecond_window_duration_is_rejected() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"500ms\" }} ]\n"
-        );
-        assert!(matches!(load(&toml), Err(ConfigError::WindowTooShort { index: 0, .. })));
+        let toml = default_config(vec![window(1, "500ms")]);
+        assert!(matches!(load(toml), Err(ConfigError::WindowTooShort { index: 0, .. })));
     }
 
     #[test]
     fn zero_second_window_duration_is_rejected() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"0s\" }} ]\n"
-        );
-        assert!(matches!(load(&toml), Err(ConfigError::WindowTooShort { index: 0, .. })));
+        let toml = default_config(vec![window(1, "0s")]);
+        assert!(matches!(load(toml), Err(ConfigError::WindowTooShort { index: 0, .. })));
     }
 
     #[test]
     fn window_duration_under_60s_is_rejected() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"59s\" }} ]\n"
-        );
-        assert!(matches!(load(&toml), Err(ConfigError::WindowTooShort { index: 0, .. })));
+        let toml = default_config(vec![window(1, "59s")]);
+        assert!(matches!(load(toml), Err(ConfigError::WindowTooShort { index: 0, .. })));
     }
 
     #[test]
     fn window_duration_of_exactly_60s_is_accepted() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"60s\" }} ]\n"
-        );
-        assert!(load(&toml).is_ok());
+        let toml = default_config(vec![window(1, "60s")]);
+        assert!(load(toml).is_ok());
     }
 
     #[test]
@@ -523,24 +543,14 @@ mod tests {
 
     #[test]
     fn window_duration_over_31_days_is_rejected() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"32d\" }} ]\n"
-        );
-        assert!(matches!(load(&toml), Err(ConfigError::WindowTooLong { index: 0, .. })));
+        let toml = default_config(vec![window(1, "32d")]);
+        assert!(matches!(load(toml), Err(ConfigError::WindowTooLong { index: 0, .. })));
     }
 
     #[test]
     fn window_duration_of_exactly_31_days_is_accepted() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"31d\" }} ]\n"
-        );
-        assert!(load(&toml).is_ok());
+        let toml = default_config(vec![window(1, "31d")]);
+        assert!(load(toml).is_ok());
     }
 
     #[test]
@@ -556,13 +566,8 @@ mod tests {
         let long = Duration::from_secs(4200);
         assert_eq!(bucket_size(short), bucket_size(long), "test premise: both durations should share a bucket size");
 
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"3600s\" }}, {{ count = 1, duration = \"4200s\" }} ]\n"
-        );
-        let config = load(&toml).expect("valid config");
+        let toml = default_config(vec![window(1, "3600s"), window(1, "4200s")]);
+        let config = load(toml).expect("valid config");
         let plan = config.plan_for("anyone");
         assert_eq!(plan.bucket_sizes, vec![bucket_size(short).as_secs()], "both windows should share one bucket size");
 
@@ -575,13 +580,8 @@ mod tests {
 
     #[test]
     fn windows_with_identical_span_keep_only_the_stricter_limit() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 100, duration = \"1h\" }}, {{ count = 20, duration = \"1h\" }} ]\n"
-        );
-        let config = load(&toml).expect("valid config");
+        let toml = default_config(vec![window(100, "1h"), window(20, "1h")]);
+        let config = load(toml).expect("valid config");
         let plan = config.plan_for("anyone");
         assert_eq!(plan.windows.len(), 1, "identical-span windows should collapse into one");
         assert_eq!(plan.windows[0].limit, 20, "the stricter (lower) limit should survive");
@@ -589,10 +589,15 @@ mod tests {
 
     #[test]
     fn bad_redis_url_is_rejected() {
-        let toml = "redis.url = \"not a url\"\nredis.db = 1\nserver.socket = \"/tmp/policy\"\n\n\
-                     [[limits]]\n\
-                     type = \"default\"\n\
-                     windows = [ { count = 1, duration = \"1h\" } ]\n";
+        let toml = toml::toml! {
+            redis.url = "not a url"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+
+            [[limits]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
         assert!(matches!(load(toml), Err(ConfigError::BadRedisUrl { .. })));
     }
 
@@ -600,36 +605,46 @@ mod tests {
     fn password_in_url_and_password_file_together_is_rejected() {
         let password_file = tempfile::NamedTempFile::new().expect("create temp file");
         std::fs::write(password_file.path(), "secret").expect("write password file");
-        let toml = format!(
-            "redis.url = \"redis://:embedded@127.0.0.1:6379\"\n\
-             redis.db = 1\n\
-             redis.password_file = \"{}\"\n\
-             server.socket = \"/tmp/policy\"\n\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"1h\" }} ]\n",
-            password_file.path().display()
-        );
-        assert!(matches!(load(&toml), Err(ConfigError::AmbiguousPassword)));
+        let path = password_file.path().display().to_string();
+        let toml = toml::toml! {
+            redis.url = "redis://:embedded@127.0.0.1:6379"
+            redis.db = 1
+            redis.password_file = path
+            server.socket = "/tmp/policy"
+
+            [[limits]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
+        assert!(matches!(load(toml), Err(ConfigError::AmbiguousPassword)));
     }
 
     #[test]
     fn missing_password_file_is_rejected() {
-        let toml = format!(
-            "{BASE}redis.password_file = \"/nonexistent/path\"\n\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"1h\" }} ]\n"
-        );
-        assert!(matches!(load(&toml), Err(ConfigError::ReadPasswordFile { .. })));
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            redis.password_file = "/nonexistent/path"
+            server.socket = "/tmp/policy"
+
+            [[limits]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
+        assert!(matches!(load(toml), Err(ConfigError::ReadPasswordFile { .. })));
     }
 
     #[test]
     fn password_in_url_alone_is_used() {
-        let toml = "redis.url = \"redis://:embedded-pw@127.0.0.1:6379\"\nredis.db = 1\nserver.socket = \"/tmp/policy\"\n\n\
-                     [[limits]]\n\
-                     type = \"default\"\n\
-                     windows = [ { count = 1, duration = \"1h\" } ]\n";
+        let toml = toml::toml! {
+            redis.url = "redis://:embedded-pw@127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+
+            [[limits]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
         let config = load(toml).expect("valid config with url-embedded password");
         assert_eq!(config.redis_connection_info.redis_settings().password(), Some("embedded-pw"));
     }
@@ -638,59 +653,60 @@ mod tests {
     fn password_file_alone_is_used_and_trimmed() {
         let password_file = tempfile::NamedTempFile::new().expect("create temp file");
         std::fs::write(password_file.path(), "file-pw\n").expect("write password file");
-        let toml = format!(
-            "{BASE}redis.password_file = \"{}\"\n\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"1h\" }} ]\n",
-            password_file.path().display()
-        );
-        let config = load(&toml).expect("valid config with password file");
+        let path = password_file.path().display().to_string();
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            redis.password_file = path
+            server.socket = "/tmp/policy"
+
+            [[limits]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
+        let config = load(toml).expect("valid config with password file");
         assert_eq!(config.redis_connection_info.redis_settings().password(), Some("file-pw"));
     }
 
     #[test]
     fn on_redis_error_defaults_to_defer() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"1h\" }} ]\n"
-        );
-        let config = load(&toml).expect("valid config");
+        let toml = default_config(vec![window(1, "1h")]);
+        let config = load(toml).expect("valid config");
         assert!(matches!(config.on_redis_error, FailureAction::Defer));
     }
 
     #[test]
     fn warn_on_unauthenticated_defaults_to_true() {
-        let toml = format!(
-            "{BASE}\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ {{ count = 1, duration = \"1h\" }} ]\n"
-        );
-        let config = load(&toml).expect("valid config");
+        let toml = default_config(vec![window(1, "1h")]);
+        let config = load(toml).expect("valid config");
         assert!(config.warn_on_unauthenticated);
     }
 
     #[test]
     fn a_representative_config_loads_successfully() {
-        let toml = "[redis]\n\
-             url = \"redis://127.0.0.1:6379\"\n\
-             db = 1\n\n\
-             [server]\n\
-             socket = \"/tmp/policy\"\n\n\
-             [[limits]]\n\
-             type = \"username\"\n\
-             username = \"alice\"\n\
-             windows = [ { count = 20, duration = \"1h\" }, { count = 100, duration = \"1d\" } ]\n\
-             [[limits]]\n\
-             type = \"regex\"\n\
-             regex = '@contractors\\.example\\.com$'\n\
-             windows = [ { count = 10, duration = \"1h\" } ]\n\
-             [[limits]]\n\
-             type = \"default\"\n\
-             windows = [ { count = 50, duration = \"1h\" }, { count = 200, duration = \"1d\" } ]\n";
+        let contractor_regex = r"@contractors\.example\.com$";
+        let toml = toml::toml! {
+            [redis]
+            url = "redis://127.0.0.1:6379"
+            db = 1
+
+            [server]
+            socket = "/tmp/policy"
+
+            [[limits]]
+            type = "username"
+            username = "alice"
+            windows = [ { count = 20, duration = "1h" }, { count = 100, duration = "1d" } ]
+
+            [[limits]]
+            type = "regex"
+            regex = contractor_regex
+            windows = [ { count = 10, duration = "1h" } ]
+
+            [[limits]]
+            type = "default"
+            windows = [ { count = 50, duration = "1h" }, { count = 200, duration = "1d" } ]
+        };
         let config = load(toml).expect("valid representative config");
         assert_eq!(config.plan_for("alice").windows[0].limit, 20);
         assert_eq!(config.plan_for("bob@contractors.example.com").windows[0].limit, 10);
