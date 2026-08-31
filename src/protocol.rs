@@ -52,10 +52,10 @@ impl Request {
     /// The authenticated SASL username, if the client authenticated.
     ///
     /// Postfix sends `sasl_username=` (present but empty) rather than omitting
-    /// the attribute for unauthenticated sessions, so an empty value is
-    /// treated as absent.
+    /// the attribute for unauthenticated sessions, so an empty value - and,
+    /// trimming first, a whitespace-only one - is treated as absent.
     pub fn sasl_username(&self) -> Option<&str> {
-        self.attributes.get("sasl_username").map(String::as_str).filter(|s| !s.is_empty())
+        self.attributes.get("sasl_username").map(|s| s.trim()).filter(|s| !s.is_empty())
     }
 
     /// The message's final recipient count, sent at the DATA stage.
@@ -85,4 +85,28 @@ impl Request {
 pub async fn write_action<W: AsyncWrite + Unpin>(writer: &mut W, action: &str) -> io::Result<()> {
     writer.write_all(format!("action={action}\n\n").as_bytes()).await?;
     writer.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with_sasl_username(sasl_username: &str) -> Request {
+        Request { attributes: HashMap::from([("sasl_username".to_string(), sasl_username.to_string())]) }
+    }
+
+    #[test]
+    fn empty_sasl_username_is_absent() {
+        assert_eq!(request_with_sasl_username("").sasl_username(), None);
+    }
+
+    #[test]
+    fn whitespace_only_sasl_username_is_absent() {
+        assert_eq!(request_with_sasl_username("   ").sasl_username(), None);
+    }
+
+    #[test]
+    fn sasl_username_is_trimmed() {
+        assert_eq!(request_with_sasl_username("  alice  ").sasl_username(), Some("alice"));
+    }
 }
