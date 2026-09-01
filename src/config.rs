@@ -13,17 +13,17 @@ pub struct Window {
     pub duration: Duration,
 }
 
-/// A `limits` entry as written in the config file, before its regex is
+/// A `sasl` entry as written in the config file, before its regex is
 /// compiled.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
-enum RawLimitRule {
+enum RawSaslLimitRule {
     Username { username: String, windows: Vec<Window> },
     Regex { regex: String, windows: Vec<Window> },
     Default { windows: Vec<Window> },
 }
 
-/// How a `LimitRule` selects which requests it applies to.
+/// How a `SaslLimitRule` selects which requests it applies to.
 #[derive(Debug, Clone)]
 pub enum Matcher {
     Username(String),
@@ -32,12 +32,12 @@ pub enum Matcher {
 
 /// A matcher paired with the plan to enforce against whatever it matches.
 #[derive(Debug, Clone)]
-pub struct LimitRule {
+pub struct SaslLimitRule {
     pub matcher: Matcher,
     pub plan: CheckPlan,
 }
 
-impl LimitRule {
+impl SaslLimitRule {
     /// Returns whether this rule applies to `sasl_username`.
     pub fn matches(&self, sasl_username: &str) -> bool {
         match &self.matcher {
@@ -243,14 +243,15 @@ struct RawServerConfig {
     warn_on_unauthenticated: bool,
 }
 
-/// The config file's shape, before `limits` is validated and its regexes
+/// The config file's shape, before `sasl` is validated and its regexes
 /// compiled.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     redis: RawRedisConfig,
     server: RawServerConfig,
-    limits: Vec<RawLimitRule>,
+    #[serde(rename = "sasl")]
+    sasl_limits: Vec<RawSaslLimitRule>,
 }
 
 /// The daemon's fully validated configuration.
@@ -261,7 +262,7 @@ pub struct Config {
     pub on_redis_error: FailureAction,
     pub warn_on_unauthenticated: bool,
     pub socket: PathBuf,
-    pub limits: Vec<LimitRule>,
+    pub sasl_limits: Vec<SaslLimitRule>,
     pub default_plan: CheckPlan,
 }
 
@@ -278,18 +279,16 @@ pub enum ConfigError {
     AmbiguousPassword,
     #[error("failed to read redis_password_file {path}: {source}")]
     ReadPasswordFile { path: PathBuf, source: std::io::Error },
-    #[error("invalid regex in limits[{index}]: {source}")]
+    #[error("invalid regex in sasl[{index}]: {source}")]
     BadRegex { index: usize, source: regex_lite::Error },
-    #[error("limits must contain exactly one `type = \"default\"` rule, found {count}")]
+    #[error("sasl must contain exactly one `type = \"default\"` rule, found {count}")]
     DefaultCount { count: usize },
     #[error(
-        "limits[{index}] has a window duration of {duration:?}, but windows must be a whole number of seconds, at \
+        "sasl[{index}] has a window duration of {duration:?}, but windows must be a whole number of seconds, at \
          least {MIN_WINDOW_DURATION:?}"
     )]
     WindowTooShort { index: usize, duration: Duration },
-    #[error(
-        "limits[{index}] has a window duration of {duration:?}, but windows must be at most {MAX_WINDOW_DURATION:?}"
-    )]
+    #[error("sasl[{index}] has a window duration of {duration:?}, but windows must be at most {MAX_WINDOW_DURATION:?}")]
     WindowTooLong { index: usize, duration: Duration },
 }
 
@@ -329,25 +328,27 @@ impl Config {
         }
         redis_connection_info = redis_connection_info.set_redis_settings(redis_settings);
 
-        let default_count = raw.limits.iter().filter(|rule| matches!(rule, RawLimitRule::Default { .. })).count();
+        let default_count =
+            raw.sasl_limits.iter().filter(|rule| matches!(rule, RawSaslLimitRule::Default { .. })).count();
         if default_count != 1 {
             return Err(ConfigError::DefaultCount { count: default_count });
         }
 
-        let mut limits = Vec::with_capacity(raw.limits.len() - 1);
+        let mut sasl_limits = Vec::with_capacity(raw.sasl_limits.len() - 1);
         let mut default_plan = None;
-        for (index, rule) in raw.limits.into_iter().enumerate() {
+        for (index, rule) in raw.sasl_limits.into_iter().enumerate() {
             match rule {
-                RawLimitRule::Username { username, windows } => {
+                RawSaslLimitRule::Username { username, windows } => {
                     validate_windows(index, &windows)?;
-                    limits.push(LimitRule { matcher: Matcher::Username(username), plan: CheckPlan::new(&windows) });
+                    sasl_limits
+                        .push(SaslLimitRule { matcher: Matcher::Username(username), plan: CheckPlan::new(&windows) });
                 }
-                RawLimitRule::Regex { regex, windows } => {
+                RawSaslLimitRule::Regex { regex, windows } => {
                     validate_windows(index, &windows)?;
                     let regex = Regex::new(&regex).map_err(|source| ConfigError::BadRegex { index, source })?;
-                    limits.push(LimitRule { matcher: Matcher::Regex(regex), plan: CheckPlan::new(&windows) });
+                    sasl_limits.push(SaslLimitRule { matcher: Matcher::Regex(regex), plan: CheckPlan::new(&windows) });
                 }
-                RawLimitRule::Default { windows } => {
+                RawSaslLimitRule::Default { windows } => {
                     validate_windows(index, &windows)?;
                     default_plan = Some(CheckPlan::new(&windows));
                 }
@@ -360,7 +361,7 @@ impl Config {
             on_redis_error: raw.server.on_redis_error,
             warn_on_unauthenticated: raw.server.warn_on_unauthenticated,
             socket: raw.server.socket,
-            limits,
+            sasl_limits,
             default_plan: default_plan.expect("default_count == 1 guarantees exactly one Default entry was seen"),
         })
     }
@@ -369,7 +370,7 @@ impl Config {
     /// rule's, or the default plan if nothing else matches.
     #[must_use]
     pub fn plan_for(&self, sasl_username: &str) -> &CheckPlan {
-        self.limits.iter().find(|rule| rule.matches(sasl_username)).map_or(&self.default_plan, |rule| &rule.plan)
+        self.sasl_limits.iter().find(|rule| rule.matches(sasl_username)).map_or(&self.default_plan, |rule| &rule.plan)
     }
 }
 
@@ -401,7 +402,7 @@ mod tests {
             redis.db = 1
             server.socket = "/tmp/policy"
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = windows
         }
@@ -415,7 +416,7 @@ mod tests {
             server.socket = "/tmp/policy"
             server.on_redis_eror = "permit"
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = [ { count = 1, duration = "1h" } ]
         };
@@ -429,7 +430,7 @@ mod tests {
             redis.db = 1
             server.socket = "/tmp/policy"
 
-            [[limits]]
+            [[sasl]]
             type = "username"
             username = "alice"
             windows = [ { count = 1, duration = "1h" } ]
@@ -444,11 +445,11 @@ mod tests {
             redis.db = 1
             server.socket = "/tmp/policy"
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = [ { count = 1, duration = "1h" } ]
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = [ { count = 2, duration = "1h" } ]
         };
@@ -462,11 +463,11 @@ mod tests {
             redis.db = 1
             server.socket = "/tmp/policy"
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = [ { count = 1, duration = "1h" } ]
 
-            [[limits]]
+            [[sasl]]
             type = "username"
             username = "alice"
             windows = [ { count = 2, duration = "1h" } ]
@@ -598,7 +599,7 @@ mod tests {
             redis.db = 1
             server.socket = "/tmp/policy"
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = [ { count = 1, duration = "1h" } ]
         };
@@ -616,7 +617,7 @@ mod tests {
             redis.password_file = path
             server.socket = "/tmp/policy"
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = [ { count = 1, duration = "1h" } ]
         };
@@ -631,7 +632,7 @@ mod tests {
             redis.password_file = "/nonexistent/path"
             server.socket = "/tmp/policy"
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = [ { count = 1, duration = "1h" } ]
         };
@@ -645,7 +646,7 @@ mod tests {
             redis.db = 1
             server.socket = "/tmp/policy"
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = [ { count = 1, duration = "1h" } ]
         };
@@ -664,7 +665,7 @@ mod tests {
             redis.password_file = path
             server.socket = "/tmp/policy"
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = [ { count = 1, duration = "1h" } ]
         };
@@ -697,17 +698,17 @@ mod tests {
             [server]
             socket = "/tmp/policy"
 
-            [[limits]]
+            [[sasl]]
             type = "username"
             username = "alice"
             windows = [ { count = 20, duration = "1h" }, { count = 100, duration = "1d" } ]
 
-            [[limits]]
+            [[sasl]]
             type = "regex"
             regex = contractor_regex
             windows = [ { count = 10, duration = "1h" } ]
 
-            [[limits]]
+            [[sasl]]
             type = "default"
             windows = [ { count = 50, duration = "1h" }, { count = 200, duration = "1d" } ]
         };

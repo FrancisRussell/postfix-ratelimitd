@@ -49,12 +49,12 @@ on_redis_error = "defer"
 # logging of it.
 warn_on_unauthenticated = true
 
-# Non-default rules are evaluated top-to-bottom; the first match wins.
-# Exactly one `type = "default"` rule must be present, as the fallback when
-# nothing else matches. Each window's duration must be a whole number of
-# seconds, at least 60s and at most 31 days.
+# Rules matching against the SASL username, evaluated top-to-bottom; the
+# first match wins. Exactly one `type = "default"` rule must be present, as
+# the fallback when nothing else matches. Each window's duration must be a
+# whole number of seconds, at least 60s and at most 31 days.
 
-#[[limits]]
+#[[sasl]]
 #type = "username"
 #username = "alice"
 #windows = [
@@ -62,14 +62,14 @@ warn_on_unauthenticated = true
 #    { count = 100, duration = "1d" },
 #]
 
-#[[limits]]
+#[[sasl]]
 #type = "regex"
 #regex = '@example\.com$'
 #windows = [
 #    { count = 10, duration = "1h" },
 #]
 
-[[limits]]
+[[sasl]]
 type = "default"
 windows = [
     { count = 50, duration = "1h" },

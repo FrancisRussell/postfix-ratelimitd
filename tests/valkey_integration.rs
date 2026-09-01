@@ -350,7 +350,7 @@ fn successful_check_writes_a_real_key() {
     let daemon = Daemon::start(
         &valkey,
         "redis.key_prefix = \"rl\"\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
     );
@@ -372,7 +372,7 @@ fn wrong_protocol_state_defers_without_checking() {
     let daemon = Daemon::start(
         &valkey,
         "redis.key_prefix = \"rl\"\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
     );
@@ -397,7 +397,7 @@ fn missing_recipient_count_defers_without_checking() {
     let daemon = Daemon::start(
         &valkey,
         "redis.key_prefix = \"rl\"\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
     );
@@ -416,7 +416,7 @@ fn unauthenticated_request_permitted_by_default() {
     let daemon = Daemon::start(
         &valkey,
         "redis.key_prefix = \"rl\"\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
     );
@@ -433,7 +433,7 @@ fn unauthenticated_request_still_permitted_with_warning_silenced() {
         &valkey,
         "redis.key_prefix = \"rl\"\n\
          server.warn_on_unauthenticated = false\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
     );
@@ -449,7 +449,7 @@ fn redis_error_defers_by_default() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(
         &valkey,
-        "[[limits]]\n\
+        "[[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
     );
@@ -468,7 +468,7 @@ fn redis_error_permits_when_configured() {
     let daemon = Daemon::start(
         &valkey,
         "server.on_redis_error = \"permit\"\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
     );
@@ -486,7 +486,7 @@ fn successful_check_over_tcp() {
     let daemon = Daemon::start(
         &valkey,
         "redis.key_prefix = \"rl\"\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
     );
@@ -507,7 +507,7 @@ fn rate_limit_exceeded_defers_and_does_not_record() {
     let daemon = Daemon::start(
         &valkey,
         "redis.key_prefix = \"rl\"\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 2, duration = \"1h\" } ]\n",
     );
@@ -535,7 +535,7 @@ fn exceeding_either_window_defers_and_accepted_records_in_both() {
     let daemon = Daemon::start(
         &valkey,
         "redis.key_prefix = \"rl\"\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 100, duration = \"1h\" }, { count = 2, duration = \"1d\" } ]\n",
     );
@@ -568,7 +568,7 @@ fn expired_entries_stop_counting_against_the_limit() {
     let daemon = Daemon::start(
         &valkey,
         "redis.key_prefix = \"rl\"\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 1, duration = \"60s\" } ]\n",
     );
@@ -612,7 +612,7 @@ fn expired_entries_stop_counting_against_the_limit() {
 fn a_week_long_window_expires_via_the_real_check_and_record_logic() {
     let valkey = ValkeyInstance::start_unix();
     let config = "redis.key_prefix = \"rl\"\n\
-                  [[limits]]\n\
+                  [[sasl]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"7d\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
@@ -652,7 +652,7 @@ fn window_lifecycle_at_the_minimum_duration_extreme() {
     // span_secs of exactly 60s (see
     // config::tests::bucket_size_hits_target_count_at_min_window_duration).
     let config = "redis.key_prefix = \"rl\"\n\
-                  [[limits]]\n\
+                  [[sasl]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"60s\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
@@ -680,7 +680,7 @@ fn window_lifecycle_at_the_maximum_duration_extreme() {
     // of 2,686,976s (~31.09d, not the nominal 2,678,400s) - see
     // config::tests::bucket_size_at_max_window_duration_does_not_yet_reach_the_clamp.
     let config = "redis.key_prefix = \"rl\"\n\
-                  [[limits]]\n\
+                  [[sasl]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"31d\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
@@ -711,7 +711,7 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
     // entry can correctly stop counting against the 19d window's own limit
     // long before it's actually deleted.
     let config = "redis.key_prefix = \"rl\"\n\
-                  [[limits]]\n\
+                  [[sasl]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"19d\" }, { count = 5, duration = \"31d\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
@@ -756,7 +756,7 @@ fn multi_window_rule_ages_out_each_window_independently() {
     // The daily cap (21) is deliberately tight, not generous like the hourly
     // one - see the last stage below, which depends on it.
     let config = "redis.key_prefix = \"rl\"\n\
-                  [[limits]]\n\
+                  [[sasl]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 20, duration = \"1h\" }, { count = 21, duration = \"1d\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
@@ -801,7 +801,7 @@ fn overcount_bound_holds_against_real_recorded_data() {
     // drift out of sync with it, unlike asserting a specific span value would.
     let duration_secs = 3600u64;
     let config = "redis.key_prefix = \"rl\"\n\
-                  [[limits]]\n\
+                  [[sasl]]\n\
                   type = \"default\"\n\
                   windows = [ { count = 1, duration = \"3600s\" } ]\n";
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
@@ -843,7 +843,7 @@ fn tls_connection_to_valkey_with_custom_ca() {
     let daemon = Daemon::start_with_env(
         &valkey,
         "redis.key_prefix = \"rl\"\n\
-         [[limits]]\n\
+         [[sasl]]\n\
          type = \"default\"\n\
          windows = [ { count = 50, duration = \"1h\" } ]\n",
         &[("SSL_CERT_FILE", ca_cert)],
