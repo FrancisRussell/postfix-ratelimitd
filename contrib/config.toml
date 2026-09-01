@@ -1,0 +1,70 @@
+[redis]
+# Connection to the RESP-compatible backend (Redis, Valkey, etc). Also accepts
+# a unix socket: url = "redis+unix:///run/valkey/valkey.sock", or TLS via a
+# "rediss://" scheme, verified against the system's trusted CAs.
+url = "redis://127.0.0.1:6379"
+# db = 0  # this is already the default
+# key_prefix = "postfix-ratelimitd"  # this is already the default
+
+# Optional; read as the connection password. Error if url also embeds one
+# (e.g. "redis://:secret@host") - supply it only one way.
+password_file = "/etc/valkey/password"
+
+[server]
+# Unix socket Postfix's check_policy_service connects to. This path doesn't
+# depend on Postfix at all - it's created fresh on each start (e.g. via
+# systemd's RuntimeDirectory=). It works as an absolute path only if
+# Postfix's smtpd isn't chrooted - a chrooted smtpd can't see anything
+# outside its chroot (usually /var/spool/postfix), regardless of path.
+#
+# Only this daemon's own user and group can reach the socket by default -
+# see contrib/postfix-ratelimitd.service for the one-off step that grants
+# Postfix access.
+#
+# If your smtpd is chrooted (common on Debian/Ubuntu), put the socket under
+# the chroot instead, e.g.:
+#   socket = "/var/spool/postfix/postfix-ratelimitd/ratelimit.sock"
+# and reference it from master.cf as a path relative to Postfix's queue
+# directory rather than by absolute path: "unix:postfix-ratelimitd/ratelimit.sock".
+# A queue-relative reference resolves the same way whether or not smtpd is
+# chrooted, so it's a fine choice for this location either way.
+socket = "/run/postfix-ratelimitd/ratelimit.sock"
+
+# Action to take when a Valkey/Redis error prevents completing a check: "defer"
+# (fail closed, the default) or "permit" (fail open).
+on_redis_error = "defer"
+
+# A request with no SASL username is always permitted - there's no identity to
+# rate-limit against - but by default it's also logged, since it usually means
+# smtpd_data_restrictions is applied somewhere it shouldn't be (see "Postfix
+# wiring" in the README). Set to false only if that's an intentional, known
+# setup and the warning is just noise.
+warn_on_unauthenticated = true
+
+# Non-default rules are evaluated top-to-bottom; the first match wins.
+# Exactly one `type = "default"` rule must be present, as the fallback when
+# nothing else matches - its position in the list doesn't matter. Each
+# window's duration must be a whole number of seconds, at least 60s and at
+# most 31 days.
+
+[[limits]]
+type = "username"
+username = "alice"
+windows = [
+    { count = 20, duration = "1h" },
+    { count = 100, duration = "1d" },
+]
+
+[[limits]]
+type = "regex"
+regex = '@contractors\.example\.com$'
+windows = [
+    { count = 10, duration = "1h" },
+]
+
+[[limits]]
+type = "default"
+windows = [
+    { count = 50, duration = "1h" },
+    { count = 200, duration = "1d" },
+]

@@ -19,7 +19,7 @@ RestartSec=2
 # name to be durably added to - see below.
 User=postfix-ratelimitd
 
-# Matches the default `server.socket` path in the example config. Combined
+# Matches the default `server.socket` path in contrib/config.toml. Combined
 # with the socket file itself being mode 0660, only this daemon's own user
 # and members of its group can reach the socket at all - which by default is
 # nobody but this daemon, since nothing else is in that group yet. Run
@@ -30,7 +30,7 @@ RuntimeDirectory=postfix-ratelimitd
 RuntimeDirectoryMode=0750
 
 # If instead using the chrooted-Postfix alternative socket location documented
-# in the example config (somewhere under /var/spool/postfix), replace the
+# in contrib/config.toml (somewhere under /var/spool/postfix), replace the
 # RuntimeDirectory= lines above with an explicit directory-creation step
 # instead, e.g.:
 #   ExecStartPre=/usr/bin/install -d -m 0750 -o postfix-ratelimitd -g postfix-ratelimitd /var/spool/postfix/postfix-ratelimitd

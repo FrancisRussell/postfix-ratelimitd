@@ -7,14 +7,17 @@ username within a sliding time window, backed by Valkey/Redis.
 
 ## Configuration
 
+A copy of the file below, ready to edit and install to
+`/etc/postfix-ratelimitd/config.toml`, lives at `contrib/config.toml`.
+
 ```toml
 [redis]
 # Connection to the RESP-compatible backend (Redis, Valkey, etc). Also accepts
 # a unix socket: url = "redis+unix:///run/valkey/valkey.sock", or TLS via a
 # "rediss://" scheme, verified against the system's trusted CAs.
 url = "redis://127.0.0.1:6379"
-db = 1
-key_prefix = "postfix-ratelimitd"
+# db = 0  # this is already the default
+# key_prefix = "postfix-ratelimitd"  # this is already the default
 
 # Optional; read as the connection password. Error if url also embeds one
 # (e.g. "redis://:secret@host") - supply it only one way.
@@ -80,10 +83,11 @@ windows = [
 ]
 ```
 
-`redis.db` picks a dedicated numbered Valkey/Redis database so this daemon's
-keys never collide with an unrelated application sharing the same server;
-`redis.key_prefix` is then purely for human-readability when inspecting the
-keyspace directly, not for isolation.
+`redis.db` selects a numbered Valkey/Redis database, defaulting to 0 like a
+plain client connection would; set it to a dedicated, non-default number so
+this daemon's keys never collide with an unrelated application sharing the
+same server. `redis.key_prefix` is then purely for human-readability when
+inspecting the keyspace directly, not for isolation.
 
 Sending the running daemon `SIGHUP` reloads the config file, including
 reconnecting to a changed `[redis]` backend. `server.socket` can't be changed

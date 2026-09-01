@@ -50,6 +50,10 @@ impl LimitRule {
 /// The default value of `redis_key_prefix` when the config file omits it.
 fn default_key_prefix() -> String { "postfix-ratelimitd".to_string() }
 
+/// The default value of `redis.db` when the config file omits it - Redis and
+/// Valkey both default a connection to database 0 when none is selected.
+fn default_db() -> i64 { 0 }
+
 /// The shortest window duration accepted. Chosen for sanity as an anti-abuse
 /// email rate limit (sub-minute windows suit burst API protection more than
 /// SMTP abuse, which is caught by hourly/daily thresholds instead), and
@@ -216,6 +220,7 @@ fn default_warn_on_unauthenticated() -> bool { true }
 #[serde(deny_unknown_fields)]
 struct RawRedisConfig {
     url: String,
+    #[serde(default = "default_db")]
     db: i64,
     #[serde(default)]
     password_file: Option<PathBuf>,
