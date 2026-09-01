@@ -3,64 +3,71 @@
 # a unix socket: url = "redis+unix:///run/valkey/valkey.sock", or TLS via a
 # "rediss://" scheme, verified against the system's trusted CAs.
 url = "redis://127.0.0.1:6379"
-# db = 0  # this is already the default
-# key_prefix = "postfix-ratelimitd"  # this is already the default
 
-# Optional; read as the connection password. Error if url also embeds one
-# (e.g. "redis://:secret@host") - supply it only one way.
-password_file = "/etc/valkey/password"
+# The numeric ID of the database to connect to.
+# db = 0
+
+# The prefix for all keys inserted into Redis/Valkey.
+# key_prefix = "postfix-ratelimitd"
+
+# Optional password file. Alternatively, the password can be embedded
+# into the URL (e.g. "redis://:secret@host") but it's an error to
+# supply both.
+# password_file = "/etc/valkey/password"
 
 [server]
-# Unix socket Postfix's check_policy_service connects to. This path doesn't
-# depend on Postfix at all - it's created fresh on each start (e.g. via
-# systemd's RuntimeDirectory=). It works as an absolute path only if
-# Postfix's smtpd isn't chrooted - a chrooted smtpd can't see anything
-# outside its chroot (usually /var/spool/postfix), regardless of path.
-#
-# Only this daemon's own user and group can reach the socket by default -
-# see contrib/postfix-ratelimitd.service for the one-off step that grants
-# Postfix access.
-#
-# If your smtpd is chrooted (common on Debian/Ubuntu), put the socket under
+
+# Unix socket that Postfix's check_policy_service connects to. The parent
+# folder is typically created via something like systemd's RuntimeDirectory
+# directive. For both chrooted and non-chrooted setups, the postfix user
+# should be added to the postfix-ratelimitd group.
+
+# If not running smtpd in a chroot, configure Postfix
+# to use the socket by specifying an absolute path.
+
+# If smtpd is chrooted (common on Debian/Ubuntu), put the socket under
 # the chroot instead, e.g.:
 #   socket = "/var/spool/postfix/postfix-ratelimitd/ratelimit.sock"
 # and reference it from master.cf as a path relative to Postfix's queue
-# directory rather than by absolute path: "unix:postfix-ratelimitd/ratelimit.sock".
-# A queue-relative reference resolves the same way whether or not smtpd is
-# chrooted, so it's a fine choice for this location either way.
+# directory rather than by absolute path:
+# "unix:postfix-ratelimitd/ratelimit.sock" (relative paths are resolved the
+# same way regardless of whether smtpd is chrooted). In this case the parent
+# folder must exist before this daemon starts and should be owned by
+# postfix-ratelimitd:postfix-ratelimitd with a permissions mode of 0750.
 socket = "/run/postfix-ratelimitd/ratelimit.sock"
 
 # Action to take when a Valkey/Redis error prevents completing a check: "defer"
-# (fail closed, the default) or "permit" (fail open).
+# or "permit". To avoid a key-store access failure silently disabling rate-limiting,
+# the default is "defer".
 on_redis_error = "defer"
 
-# A request with no SASL username is always permitted - there's no identity to
-# rate-limit against - but by default it's also logged, since it usually means
-# smtpd_data_restrictions is applied somewhere it shouldn't be (see "Postfix
-# wiring" in the README). Set to false only if that's an intentional, known
-# setup and the warning is just noise.
+# Typically authenticated and unauthenticated mail is received on different
+# smtpd instances. Unauthenticated mail will neither be blocked nor rate-limited
+# but since this is suggestive of a Postfix configuration error it is logged.
+# If there is a legitimate expectation of authenticated and unauthenticated mail
+# sharing this restriction class, this value can be set to `false` to disable
+# logging of it.
 warn_on_unauthenticated = true
 
 # Non-default rules are evaluated top-to-bottom; the first match wins.
 # Exactly one `type = "default"` rule must be present, as the fallback when
-# nothing else matches - its position in the list doesn't matter. Each
-# window's duration must be a whole number of seconds, at least 60s and at
-# most 31 days.
+# nothing else matches. Each window's duration must be a whole number of
+# seconds, at least 60s and at most 31 days.
 
-[[limits]]
-type = "username"
-username = "alice"
-windows = [
-    { count = 20, duration = "1h" },
-    { count = 100, duration = "1d" },
-]
+#[[limits]]
+#type = "username"
+#username = "alice"
+#windows = [
+#    { count = 20, duration = "1h" },
+#    { count = 100, duration = "1d" },
+#]
 
-[[limits]]
-type = "regex"
-regex = '@contractors\.example\.com$'
-windows = [
-    { count = 10, duration = "1h" },
-]
+#[[limits]]
+#type = "regex"
+#regex = '@example\.com$'
+#windows = [
+#    { count = 10, duration = "1h" },
+#]
 
 [[limits]]
 type = "default"
