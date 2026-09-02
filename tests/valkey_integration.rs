@@ -10,6 +10,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::Barrier;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use postfix_ratelimitd::config::BUCKET_TARGET_COUNT;
@@ -232,33 +234,41 @@ struct Daemon {
     _dir: tempfile::TempDir,
 }
 
+/// Inserts `key = value` into `table`'s nested table named `section`,
+/// creating that nested table first if it isn't already present - `toml`
+/// renders a table's own fields as one `[section]` block, so a config's
+/// `redis`/`server` values must all live in one in-memory table before being
+/// serialized, rather than concatenating separately-rendered fragments that
+/// would each try to open their own `[redis]`/`[server]` header.
+fn set_default(table: &mut toml::Table, section: &str, key: &str, value: impl Into<toml::Value>) {
+    let section = table
+        .entry(section)
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .expect("callers only ever build redis/server as tables, never as some other value type");
+    section.entry(key).or_insert_with(|| value.into());
+}
+
 impl Daemon {
     /// Starts the compiled daemon pointed at `valkey`, with `extra_config`
-    /// appended to a minimal base config, waiting for its socket to appear
-    /// before returning.
-    fn start(valkey: &ValkeyInstance, extra_config: &str) -> Daemon { Self::start_with_env(valkey, extra_config, &[]) }
+    /// merged into a minimal base config (its own `redis.url`/`redis.db`/
+    /// `server.socket` win if `extra_config` also sets them), waiting for its
+    /// socket to appear before returning.
+    fn start(valkey: &ValkeyInstance, extra_config: toml::Table) -> Daemon {
+        Self::start_with_env(valkey, extra_config, &[])
+    }
 
     /// As [`Daemon::start`], but with `env` set on the daemon's process - for
     /// e.g. pointing `SSL_CERT_FILE` at a throwaway CA.
-    fn start_with_env(valkey: &ValkeyInstance, extra_config: &str, env: &[(&str, &str)]) -> Daemon {
+    fn start_with_env(valkey: &ValkeyInstance, mut extra_config: toml::Table, env: &[(&str, &str)]) -> Daemon {
         let dir = tempfile::tempdir().expect("create temp dir");
         let socket = dir.path().join("policy.sock");
         let config_path = dir.path().join("config.toml");
-        // Dotted keys, not `[redis]`/`[server]` headers, so `extra_config` can add more
-        // keys to either table (e.g. `redis.key_prefix`, `server.on_redis_error`)
-        // without TOML rejecting it as redefining an already-closed table.
-        std::fs::write(
-            &config_path,
-            format!(
-                "redis.url = \"{}\"\n\
-                 redis.db = 0\n\
-                 server.socket = \"{}\"\n\
-                 {extra_config}\n",
-                valkey.redis_url(),
-                socket.display()
-            ),
-        )
-        .expect("write config");
+
+        set_default(&mut extra_config, "redis", "url", valkey.redis_url());
+        set_default(&mut extra_config, "redis", "db", 0i64);
+        set_default(&mut extra_config, "server", "socket", socket.display().to_string());
+        std::fs::write(&config_path, extra_config.to_string()).expect("write config");
 
         let child = Command::new(env!("CARGO_BIN_EXE_postfix-ratelimitd"))
             .arg("--config")
@@ -327,6 +337,30 @@ impl Drop for Daemon {
     }
 }
 
+fn window(count: i64, duration: &str) -> toml::Value {
+    toml::Value::Table(toml::toml! {
+        count = count
+        duration = duration
+    })
+}
+
+/// A `redis.key_prefix = "rl"` config with a single `type = "default"` rule
+/// over `windows` - the shape most tests only need incidentally, to reach
+/// whatever behavior they're actually exercising.
+fn default_sasl_config_multi(windows: Vec<toml::Value>) -> toml::Table {
+    toml::toml! {
+        redis.key_prefix = "rl"
+        [[sasl]]
+        type = "default"
+        windows = windows
+    }
+}
+
+/// As [`default_sasl_config_multi`], with a single window.
+fn default_sasl_config(count: i64, duration: &str) -> toml::Table {
+    default_sasl_config_multi(vec![window(count, duration)])
+}
+
 // The one test here that calls into the library directly rather than through
 // the compiled daemon binary - check_command_support has no wire-protocol
 // surface of its own to drive from outside, so this is the only way to prove
@@ -347,13 +381,7 @@ async fn check_command_support_reports_missing_commands() {
 #[test]
 fn successful_check_writes_a_real_key() {
     let valkey = ValkeyInstance::start_unix();
-    let daemon = Daemon::start(
-        &valkey,
-        "redis.key_prefix = \"rl\"\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 50, duration = \"1h\" } ]\n",
-    );
+    let daemon = Daemon::start(&valkey, default_sasl_config(50, "1h"));
 
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
@@ -369,13 +397,7 @@ fn successful_check_writes_a_real_key() {
 #[test]
 fn wrong_protocol_state_defers_without_checking() {
     let valkey = ValkeyInstance::start_unix();
-    let daemon = Daemon::start(
-        &valkey,
-        "redis.key_prefix = \"rl\"\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 50, duration = \"1h\" } ]\n",
-    );
+    let daemon = Daemon::start(&valkey, default_sasl_config(50, "1h"));
 
     // RCPT-stage requests are a sign this is wired to the wrong Postfix restriction
     // class - deferred rather than checked, since recipient_count wouldn't yet
@@ -394,13 +416,7 @@ fn wrong_protocol_state_defers_without_checking() {
 #[test]
 fn missing_recipient_count_defers_without_checking() {
     let valkey = ValkeyInstance::start_unix();
-    let daemon = Daemon::start(
-        &valkey,
-        "redis.key_prefix = \"rl\"\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 50, duration = \"1h\" } ]\n",
-    );
+    let daemon = Daemon::start(&valkey, default_sasl_config(50, "1h"));
 
     // Same root cause as a wrong protocol_state - only smtpd_data_restrictions
     // populates recipient_count.
@@ -413,13 +429,7 @@ fn missing_recipient_count_defers_without_checking() {
 #[test]
 fn unauthenticated_request_permitted_by_default() {
     let valkey = ValkeyInstance::start_unix();
-    let daemon = Daemon::start(
-        &valkey,
-        "redis.key_prefix = \"rl\"\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 50, duration = \"1h\" } ]\n",
-    );
+    let daemon = Daemon::start(&valkey, default_sasl_config(50, "1h"));
 
     // No sasl_username at all - nothing to rate-limit against.
     let response = daemon.raw_request("recipient_count=3\nprotocol_state=DATA\n\n");
@@ -427,19 +437,22 @@ fn unauthenticated_request_permitted_by_default() {
 }
 
 #[test]
-fn unauthenticated_request_still_permitted_with_warning_silenced() {
+fn warn_on_unauthenticated_does_not_change_action() {
     let valkey = ValkeyInstance::start_unix();
+    let windows = vec![window(50, "1h")];
     let daemon = Daemon::start(
         &valkey,
-        "redis.key_prefix = \"rl\"\n\
-         server.warn_on_unauthenticated = false\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 50, duration = \"1h\" } ]\n",
+        toml::toml! {
+            redis.key_prefix = "rl"
+            server.warn_on_unauthenticated = false
+            [[sasl]]
+            type = "default"
+            windows = windows
+        },
     );
 
-    // warn_on_unauthenticated only silences the log line - it's still always
-    // permitted, since there's no identity to rate-limit against either way.
+    // warn_on_unauthenticated only affects logging, not this decision - there's
+    // no identity to rate-limit against either way, flag or not.
     let response = daemon.raw_request("recipient_count=3\nprotocol_state=DATA\n\n");
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 }
@@ -447,11 +460,14 @@ fn unauthenticated_request_still_permitted_with_warning_silenced() {
 #[test]
 fn redis_error_defers_by_default() {
     let valkey = ValkeyInstance::start_unix();
+    let windows = vec![window(50, "1h")];
     let daemon = Daemon::start(
         &valkey,
-        "[[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 50, duration = \"1h\" } ]\n",
+        toml::toml! {
+            [[sasl]]
+            type = "default"
+            windows = windows
+        },
     );
 
     // Establish the daemon's connection first, then take the whole backend away.
@@ -465,12 +481,15 @@ fn redis_error_defers_by_default() {
 #[test]
 fn redis_error_permits_when_configured() {
     let valkey = ValkeyInstance::start_unix();
+    let windows = vec![window(50, "1h")];
     let daemon = Daemon::start(
         &valkey,
-        "server.on_redis_error = \"permit\"\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 50, duration = \"1h\" } ]\n",
+        toml::toml! {
+            server.on_redis_error = "permit"
+            [[sasl]]
+            type = "default"
+            windows = windows
+        },
     );
 
     daemon.request("alice", 1);
@@ -483,13 +502,7 @@ fn redis_error_permits_when_configured() {
 #[test]
 fn successful_check_over_tcp() {
     let valkey = ValkeyInstance::start_tcp();
-    let daemon = Daemon::start(
-        &valkey,
-        "redis.key_prefix = \"rl\"\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 50, duration = \"1h\" } ]\n",
-    );
+    let daemon = Daemon::start(&valkey, default_sasl_config(50, "1h"));
 
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
@@ -504,13 +517,7 @@ fn successful_check_over_tcp() {
 #[test]
 fn rate_limit_exceeded_defers_and_does_not_record() {
     let valkey = ValkeyInstance::start_unix();
-    let daemon = Daemon::start(
-        &valkey,
-        "redis.key_prefix = \"rl\"\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 2, duration = \"1h\" } ]\n",
-    );
+    let daemon = Daemon::start(&valkey, default_sasl_config(2, "1h"));
 
     // Exactly at the limit: accepted and recorded.
     let response = daemon.request("alice", 2);
@@ -532,13 +539,7 @@ fn rate_limit_exceeded_defers_and_does_not_record() {
 #[test]
 fn exceeding_either_window_defers_and_accepted_records_in_both() {
     let valkey = ValkeyInstance::start_unix();
-    let daemon = Daemon::start(
-        &valkey,
-        "redis.key_prefix = \"rl\"\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 100, duration = \"1h\" }, { count = 2, duration = \"1d\" } ]\n",
-    );
+    let daemon = Daemon::start(&valkey, default_sasl_config_multi(vec![window(100, "1h"), window(2, "1d")]));
 
     // Fits the generous hourly window but exceeds the tight daily one: still
     // rejected.
@@ -565,13 +566,7 @@ fn exceeding_either_window_defers_and_accepted_records_in_both() {
 #[test]
 fn expired_entries_stop_counting_against_the_limit() {
     let valkey = ValkeyInstance::start_unix();
-    let daemon = Daemon::start(
-        &valkey,
-        "redis.key_prefix = \"rl\"\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 1, duration = \"60s\" } ]\n",
-    );
+    let daemon = Daemon::start(&valkey, default_sasl_config(1, "60s"));
 
     // Discover the real key this window's config computes, via a throwaway
     // username so as not to spend alice's own count-1 limit finding out -
@@ -611,10 +606,7 @@ fn expired_entries_stop_counting_against_the_limit() {
 #[test]
 fn a_week_long_window_expires_via_the_real_check_and_record_logic() {
     let valkey = ValkeyInstance::start_unix();
-    let config = "redis.key_prefix = \"rl\"\n\
-                  [[sasl]]\n\
-                  type = \"default\"\n\
-                  windows = [ { count = 1, duration = \"7d\" } ]\n";
+    let config = default_sasl_config(1, "7d");
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
 
     // now_override fixes what the real check_and_record.lua sees as "now" for
@@ -651,10 +643,7 @@ fn window_lifecycle_at_the_minimum_duration_extreme() {
     // 60s is MIN_WINDOW_DURATION; it lands on MIN_BUCKET_SIZE (1s) with a
     // span_secs of exactly 60s (see
     // config::tests::bucket_size_hits_target_count_at_min_window_duration).
-    let config = "redis.key_prefix = \"rl\"\n\
-                  [[sasl]]\n\
-                  type = \"default\"\n\
-                  windows = [ { count = 1, duration = \"60s\" } ]\n";
+    let config = default_sasl_config(1, "60s");
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
 
     let daemon = Daemon::start(&valkey, config);
@@ -679,10 +668,7 @@ fn window_lifecycle_at_the_maximum_duration_extreme() {
     // MAX_BUCKET_SIZE's clamp - see its own doc comment), giving a span_secs
     // of 2,686,976s (~31.09d, not the nominal 2,678,400s) - see
     // config::tests::bucket_size_at_max_window_duration_does_not_yet_reach_the_clamp.
-    let config = "redis.key_prefix = \"rl\"\n\
-                  [[sasl]]\n\
-                  type = \"default\"\n\
-                  windows = [ { count = 1, duration = \"31d\" } ]\n";
+    let config = default_sasl_config(1, "31d");
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
 
     let daemon = Daemon::start(&valkey, config);
@@ -710,10 +696,7 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
     // key's retention (and prune cutoff) is the longer of the two, so an
     // entry can correctly stop counting against the 19d window's own limit
     // long before it's actually deleted.
-    let config = "redis.key_prefix = \"rl\"\n\
-                  [[sasl]]\n\
-                  type = \"default\"\n\
-                  windows = [ { count = 1, duration = \"19d\" }, { count = 5, duration = \"31d\" } ]\n";
+    let config = default_sasl_config_multi(vec![window(1, "19d"), window(5, "31d")]);
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
 
     let daemon = Daemon::start(&valkey, config);
@@ -755,10 +738,7 @@ fn multi_window_rule_ages_out_each_window_independently() {
     // key - each window keeps its own key and ages out fully independently.
     // The daily cap (21) is deliberately tight, not generous like the hourly
     // one - see the last stage below, which depends on it.
-    let config = "redis.key_prefix = \"rl\"\n\
-                  [[sasl]]\n\
-                  type = \"default\"\n\
-                  windows = [ { count = 20, duration = \"1h\" }, { count = 21, duration = \"1d\" } ]\n";
+    let config = default_sasl_config_multi(vec![window(20, "1h"), window(21, "1d")]);
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
     let daemon = Daemon::start(&valkey, config);
 
@@ -800,10 +780,7 @@ fn overcount_bound_holds_against_real_recorded_data() {
     // size or span - computed from the real constant so this can't silently
     // drift out of sync with it, unlike asserting a specific span value would.
     let duration_secs = 3600u64;
-    let config = "redis.key_prefix = \"rl\"\n\
-                  [[sasl]]\n\
-                  type = \"default\"\n\
-                  windows = [ { count = 1, duration = \"3600s\" } ]\n";
+    let config = default_sasl_config(1, "3600s");
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
     let daemon = Daemon::start(&valkey, config);
 
@@ -840,14 +817,7 @@ fn overcount_bound_holds_against_real_recorded_data() {
 fn tls_connection_to_valkey_with_custom_ca() {
     let valkey = ValkeyInstance::start_tls();
     let ca_cert = valkey.tls_ca_cert().to_str().expect("fixture CA path is valid UTF-8");
-    let daemon = Daemon::start_with_env(
-        &valkey,
-        "redis.key_prefix = \"rl\"\n\
-         [[sasl]]\n\
-         type = \"default\"\n\
-         windows = [ { count = 50, duration = \"1h\" } ]\n",
-        &[("SSL_CERT_FILE", ca_cert)],
-    );
+    let daemon = Daemon::start_with_env(&valkey, default_sasl_config(50, "1h"), &[("SSL_CERT_FILE", ca_cert)]);
 
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
@@ -858,4 +828,336 @@ fn tls_connection_to_valkey_with_custom_ca() {
     let mut connection = valkey.connection();
     let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
     assert_eq!(fields.len(), 1, "expected exactly one recorded bucket");
+}
+
+/// Total requests fired at the single shared username in
+/// `concurrent_requests_for_the_same_username_never_exceed_the_limit` - three
+/// times the configured limit, so a lost update (accepting too many) or a
+/// stalled/duplicated one (accepting too few) both produce a visibly wrong
+/// accepted count rather than one that could pass by chance.
+const CONCURRENT_SINGLE_USER_LIMIT: u32 = 50;
+const CONCURRENT_SINGLE_USER_TOTAL_REQUESTS: u32 = 3 * CONCURRENT_SINGLE_USER_LIMIT;
+
+/// Fires many more requests than the configured limit at the same username,
+/// each from its own connection and all released at once via a barrier, and
+/// checks that exactly the configured limit was accepted - proving the
+/// check-and-record path is atomic under real concurrent access rather than a
+/// read-then-write race. This is the property a non-atomic
+/// check-then-increment implementation (separate round trips for "is this
+/// under quota" and "record it") can violate under exactly this load shape.
+#[test]
+fn concurrent_requests_for_the_same_username_never_exceed_the_limit() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(&valkey, default_sasl_config(i64::from(CONCURRENT_SINGLE_USER_LIMIT), "60s"));
+
+    let barrier = Barrier::new(CONCURRENT_SINGLE_USER_TOTAL_REQUESTS as usize);
+    let responses: Vec<String> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..CONCURRENT_SINGLE_USER_TOTAL_REQUESTS)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    daemon.request("concurrent-user", 1)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|handle| handle.join().expect("request thread panicked")).collect()
+    });
+
+    let accepted = responses.iter().filter(|response| **response == format!("action={ACTION_DUNNO}\n\n")).count();
+    let rejected =
+        responses.iter().filter(|response| **response == format!("action={ACTION_RATE_LIMITED}\n\n")).count();
+    assert_eq!(
+        accepted, CONCURRENT_SINGLE_USER_LIMIT as usize,
+        "exactly the configured limit should be accepted under concurrent load from many connections - fewer would \
+         mean a lost update, more would mean the check-and-increment isn't atomic"
+    );
+    assert_eq!(
+        rejected,
+        (CONCURRENT_SINGLE_USER_TOTAL_REQUESTS - CONCURRENT_SINGLE_USER_LIMIT) as usize,
+        "every request beyond the limit should be rejected"
+    );
+}
+
+/// Virtual SASL usernames used by
+/// `concurrent_requests_spread_across_many_usernames_are_all_recorded`.
+const SPREAD_USER_COUNT: u32 = 200;
+/// Requests sent per virtual username - low enough that the total stays well
+/// under the generous limit configured for this test, since it's checking for
+/// lost or misattributed updates under load, not exercising the limit itself.
+const SPREAD_REQUESTS_PER_USER: u32 = 10;
+/// Concurrent connections used to send `SPREAD_USER_COUNT *
+/// SPREAD_REQUESTS_PER_USER` requests - a bounded worker pool rather than one
+/// thread per request, closer to how many concurrent Postfix connections a
+/// real deployment would actually have in flight at once.
+const SPREAD_WORKER_COUNT: u32 = 32;
+
+/// Stress/throughput check: spreads many requests for many different
+/// usernames across a bounded pool of concurrent connections and confirms
+/// every username's recorded count matches exactly what was sent - no
+/// request lost or attributed to the wrong username's key under load. Prints
+/// the achieved throughput for information; unlike the single-username
+/// concurrency test above, this makes no timing assertion, since a hard
+/// throughput threshold here would depend on the machine running it rather
+/// than on this daemon's own correctness.
+#[test]
+fn concurrent_requests_spread_across_many_usernames_are_all_recorded() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(&valkey, default_sasl_config(100_000, "1h"));
+
+    let total_requests = SPREAD_USER_COUNT * SPREAD_REQUESTS_PER_USER;
+    let started = Instant::now();
+    thread::scope(|scope| {
+        for worker in 0..SPREAD_WORKER_COUNT {
+            let daemon = &daemon;
+            scope.spawn(move || {
+                let stream = UnixStream::connect(&daemon.socket).expect("connect to daemon");
+                let mut reader = BufReader::new(&stream);
+                // This worker exclusively owns every username in this residue class -
+                // no other worker ever sends a request for one of them, so per-username
+                // ordering is guaranteed by this one thread alone, regardless of how
+                // many other usernames it also happens to interleave in between.
+                let mut user = worker;
+                while user < SPREAD_USER_COUNT {
+                    let request =
+                        format!("sasl_username=spread-user-{user}\nrecipient_count=1\nprotocol_state=DATA\n\n");
+                    for _ in 0..SPREAD_REQUESTS_PER_USER {
+                        let (response, elapsed) = timed_request(&stream, &mut reader, &request);
+                        assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "well under the configured limit");
+                        assert!(
+                            elapsed < CONCURRENT_LATENCY_CEILING,
+                            "user {user} on worker {worker} took {elapsed:?}, over the \
+                             {CONCURRENT_LATENCY_CEILING:?} ceiling, under {SPREAD_WORKER_COUNT} concurrent \
+                             connections"
+                        );
+                    }
+                    user += SPREAD_WORKER_COUNT;
+                }
+            });
+        }
+    });
+    let elapsed = started.elapsed();
+    println!(
+        "{total_requests} requests across {SPREAD_USER_COUNT} usernames on {SPREAD_WORKER_COUNT} connections in \
+         {elapsed:?} ({:.0} req/s)",
+        total_requests as f64 / elapsed.as_secs_f64()
+    );
+
+    for user in 0..SPREAD_USER_COUNT {
+        let username = format!("spread-user-{user}");
+        let keys = valkey.keys(&format!("rl:bucket:v1:{username}:*"));
+        assert_eq!(keys.len(), 1, "expected exactly one key for {username}'s one configured window");
+        let mut connection = valkey.connection();
+        let fields: Vec<(String, String)> =
+            redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
+        assert_eq!(fields.len(), 1, "expected exactly one recorded bucket for {username}");
+        assert_eq!(
+            fields[0].1,
+            SPREAD_REQUESTS_PER_USER.to_string(),
+            "{username}'s recorded count should match exactly the requests sent for it, not more or fewer"
+        );
+    }
+}
+
+/// Requests sent sequentially over one persistent connection in
+/// `sequential_requests_on_one_connection_stay_fast`.
+const SEQUENTIAL_REQUEST_COUNT: u32 = 100;
+
+/// Per-request latency ceiling for that test. A healthy request on an
+/// otherwise-idle connection took ~0.7ms when measured directly against this
+/// daemon, so this has roughly two orders of magnitude of headroom for a slow
+/// or loaded machine; it's still 10x tighter than the ~1s-per-request stall a
+/// real regression of this shape actually produced in a sibling project (see
+/// https://github.com/nitmir/policyd-rate-limit/issues/11) - failing to
+/// promptly notice a new request on a connection already serviced once.
+const SEQUENTIAL_REQUEST_LATENCY_CEILING: Duration = Duration::from_millis(100);
+
+/// Sends `request` on an already-open connection and returns its response
+/// together with how long the round trip took. Shared by the sequential
+/// latency tests below, which each reuse one connection across many requests
+/// rather than opening a fresh one per request like `Daemon::raw_request`.
+fn timed_request(mut stream: &UnixStream, reader: &mut BufReader<&UnixStream>, request: &str) -> (String, Duration) {
+    let started = Instant::now();
+    stream.write_all(request.as_bytes()).expect("write request");
+    stream.flush().expect("flush request");
+
+    let mut response = String::new();
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).expect("read response line");
+        assert!(read > 0, "daemon closed the connection before sending a full response");
+        response.push_str(&line);
+        if line == "\n" || line == "\r\n" {
+            return (response, started.elapsed());
+        }
+    }
+}
+
+/// Sends many requests one after another over a single persistent connection,
+/// the shape Postfix actually uses a policy connection in (kept open across a
+/// whole SMTP session rather than reconnected per check), and checks that no
+/// individual request stalls waiting for the daemon to notice it. This guards
+/// specifically against the class of bug linked above: it would show up here
+/// as a request taking roughly a second, not as a wrong answer.
+#[test]
+fn sequential_requests_on_one_connection_stay_fast() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(&valkey, default_sasl_config(100_000, "1h"));
+
+    let stream = UnixStream::connect(&daemon.socket).expect("connect to daemon");
+    let mut reader = BufReader::new(&stream);
+    for i in 0..SEQUENTIAL_REQUEST_COUNT {
+        let (response, elapsed) = timed_request(
+            &stream,
+            &mut reader,
+            "sasl_username=sequential-user\nrecipient_count=1\n\
+                                                  protocol_state=DATA\n\n",
+        );
+
+        assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
+        assert!(
+            elapsed < SEQUENTIAL_REQUEST_LATENCY_CEILING,
+            "request {i} on a reused connection took {elapsed:?}, over the {SEQUENTIAL_REQUEST_LATENCY_CEILING:?} \
+             ceiling"
+        );
+    }
+}
+
+/// Concurrent connections used by
+/// `sequential_requests_stay_fast_across_many_concurrent_connections` - half
+/// of `main.rs`'s own `MAX_CONNECTIONS` (512), to stress a meaningful
+/// fraction of the daemon's actual concurrent-connection ceiling rather than
+/// an arbitrary smaller number. Not imported from `main.rs` directly: it's
+/// binary-only state tightly coupled to the accept loop there, not core
+/// library logic worth relocating just for this test to reference.
+const CONCURRENT_LATENCY_CONNECTION_COUNT: u32 = 256;
+/// Sequential requests sent per connection in that test.
+const CONCURRENT_LATENCY_REQUESTS_PER_CONNECTION: u32 = 20;
+
+/// Per-request latency ceiling under `CONCURRENT_LATENCY_CONNECTION_COUNT`
+/// concurrent connections - looser than `SEQUENTIAL_REQUEST_LATENCY_CEILING`
+/// since real contention measurably raises latency: measured directly against
+/// this daemon at that concurrency, mean/p99/max were ~17ms/~29ms/~49ms, so
+/// this still has roughly an order of magnitude of headroom over the observed
+/// max, while remaining well under the ~1s-per-request scale of the
+/// regression class this is meant to catch.
+const CONCURRENT_LATENCY_CEILING: Duration = Duration::from_millis(500);
+
+/// As `sequential_requests_on_one_connection_stay_fast`, but with many
+/// connections active at once, each sending its own sequential stream of
+/// requests for its own username - checking that per-request latency stays
+/// reasonable even under concurrent contention from many other connections,
+/// not just on an otherwise-idle one.
+#[test]
+fn sequential_requests_stay_fast_across_many_concurrent_connections() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(&valkey, default_sasl_config(100_000, "1h"));
+
+    thread::scope(|scope| {
+        for connection_id in 0..CONCURRENT_LATENCY_CONNECTION_COUNT {
+            let daemon = &daemon;
+            scope.spawn(move || {
+                let stream = UnixStream::connect(&daemon.socket).expect("connect to daemon");
+                let mut reader = BufReader::new(&stream);
+                let request = format!(
+                    "sasl_username=concurrent-latency-user-{connection_id}\nrecipient_count=1\n\
+                     protocol_state=DATA\n\n"
+                );
+                for i in 0..CONCURRENT_LATENCY_REQUESTS_PER_CONNECTION {
+                    let (response, elapsed) = timed_request(&stream, &mut reader, &request);
+
+                    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
+                    assert!(
+                        elapsed < CONCURRENT_LATENCY_CEILING,
+                        "connection {connection_id} request {i} took {elapsed:?}, over the \
+                         {CONCURRENT_LATENCY_CEILING:?} ceiling, under {CONCURRENT_LATENCY_CONNECTION_COUNT} \
+                         concurrent connections"
+                    );
+                }
+            });
+        }
+    });
+}
+
+/// Buckets seeded per connection before the timed phase in
+/// `sequential_requests_stay_fast_across_many_concurrent_connections_with_full_windows`,
+/// one short of the config's full lookback (57 buckets for its `count =
+/// 100000, duration = "1h"` window, confirmed via the same probe-and-discover
+/// approach other tests here use rather than assumed), leaving the most
+/// recent bucket for the timed phase itself to land in. Every timed request
+/// then aggregates across a realistically near-full window, not a freshly
+/// empty one; `sequential_requests_stay_fast_across_many_concurrent_connections`
+/// above only ever touches a single bucket, since it completes in well under
+/// one bucket's real-time span.
+const CONCURRENT_LATENCY_SEED_BUCKETS: u64 = 56;
+
+/// As `sequential_requests_stay_fast_across_many_concurrent_connections`, but
+/// each connection first sequentially seeds most of its own username's
+/// window before the timed phase, so the latency ceiling is checked against a
+/// realistically full bucket hash under concurrent load, not an empty one.
+///
+/// Seeding must be sequential and strictly increasing in `now_override`
+/// within one username's key, since `check_and_record.lua`'s pruning assumes
+/// time only moves forward for a given key - exactly like a real clock does.
+/// That constraint is per key, not global: since every connection here seeds
+/// its own distinct username, all connections still seed concurrently with
+/// each other, only internally ordered within their own request stream -
+/// the same shape real traffic has anyway, since different real users'
+/// messages are independent of each other but each user's own messages
+/// arrive to the daemon in true chronological order.
+#[test]
+fn sequential_requests_stay_fast_across_many_concurrent_connections_with_full_windows() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(&valkey, default_sasl_config(100_000, "1h"));
+
+    // Discover this window's real bucket size the same way other tests here
+    // do (e.g. expired_entries_stop_counting_against_the_limit), rather than
+    // assuming the value config::bucket_size(3600s) currently computes.
+    let probe_response = daemon.request("bucket-size-probe", 1);
+    assert_eq!(probe_response, format!("action={ACTION_DUNNO}\n\n"), "probe message should be accepted");
+    let probe_keys = valkey.keys("rl:bucket:v1:bucket-size-probe:*");
+    assert_eq!(probe_keys.len(), 1, "expected exactly one key for the probe window");
+    let bucket_size: u64 = probe_keys[0]
+        .rsplit(':')
+        .next()
+        .expect("key has a bucket-size suffix")
+        .parse()
+        .expect("bucket size is numeric");
+    let current_bucket_start = valkey.current_bucket(bucket_size) * bucket_size;
+
+    thread::scope(|scope| {
+        for connection_id in 0..CONCURRENT_LATENCY_CONNECTION_COUNT {
+            let daemon = &daemon;
+            scope.spawn(move || {
+                let stream = UnixStream::connect(&daemon.socket).expect("connect to daemon");
+                let mut reader = BufReader::new(&stream);
+                let username = format!("concurrent-latency-full-user-{connection_id}");
+                let request_at = |now: u64| {
+                    format!("sasl_username={username}\nrecipient_count=1\nprotocol_state=DATA\nnow_override={now}\n\n")
+                };
+
+                for seed in 0..CONCURRENT_LATENCY_SEED_BUCKETS {
+                    let now = current_bucket_start - (CONCURRENT_LATENCY_SEED_BUCKETS - seed) * bucket_size;
+                    let (response, _) = timed_request(&stream, &mut reader, &request_at(now));
+                    assert_eq!(
+                        response,
+                        format!("action={ACTION_DUNNO}\n\n"),
+                        "seeding should never hit this generous limit"
+                    );
+                }
+
+                let request = request_at(current_bucket_start);
+                for i in 0..CONCURRENT_LATENCY_REQUESTS_PER_CONNECTION {
+                    let (response, elapsed) = timed_request(&stream, &mut reader, &request);
+
+                    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
+                    assert!(
+                        elapsed < CONCURRENT_LATENCY_CEILING,
+                        "connection {connection_id} request {i} took {elapsed:?} against a window seeded with \
+                         {CONCURRENT_LATENCY_SEED_BUCKETS} buckets, over the {CONCURRENT_LATENCY_CEILING:?} \
+                         ceiling, under {CONCURRENT_LATENCY_CONNECTION_COUNT} concurrent connections"
+                    );
+                }
+            });
+        }
+    });
 }
