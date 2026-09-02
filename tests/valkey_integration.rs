@@ -395,6 +395,39 @@ fn successful_check_writes_a_real_key() {
 }
 
 #[test]
+fn unrestricted_rule_permits_any_volume_and_records_nothing() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(
+        &valkey,
+        toml::toml! {
+            redis.key_prefix = "rl"
+            [[sasl]]
+            type = "username"
+            username = "trusted-service"
+            unrestricted = true
+            [[sasl]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        },
+    );
+
+    // Far beyond the default rule's own count-1 limit, in one message and
+    // across several - an unrestricted rule has no limit to exceed.
+    for _ in 0..5 {
+        let response = daemon.request("trusted-service", 1000);
+        assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
+    }
+    assert!(
+        valkey.keys("rl:bucket:v1:trusted-service:*").is_empty(),
+        "an unrestricted rule has no window to record anything in"
+    );
+
+    // The default rule's own limit still applies normally to anyone else.
+    let response = daemon.request("alice", 2);
+    assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"), "unrestricted should not affect other rules");
+}
+
+#[test]
 fn wrong_protocol_state_defers_without_checking() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(&valkey, default_sasl_config(50, "1h"));

@@ -14,13 +14,35 @@ pub struct Window {
 }
 
 /// A `sasl` entry as written in the config file, before its regex is
-/// compiled.
+/// compiled. `windows` and `unrestricted` are both optional and independent
+/// at this level - omitting either leaves it `None`, distinct from writing
+/// it out as empty or `false`. `build_plan` treats every combination other
+/// than "windows only" or "unrestricted = true only" as an error - see its
+/// own doc comment for why `unrestricted = false` is rejected rather than
+/// accepted as a no-op.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 enum RawSaslLimitRule {
-    Username { username: String, windows: Vec<Window> },
-    Regex { regex: String, windows: Vec<Window> },
-    Default { windows: Vec<Window> },
+    Username {
+        username: String,
+        #[serde(default)]
+        windows: Option<Vec<Window>>,
+        #[serde(default)]
+        unrestricted: Option<bool>,
+    },
+    Regex {
+        regex: String,
+        #[serde(default)]
+        windows: Option<Vec<Window>>,
+        #[serde(default)]
+        unrestricted: Option<bool>,
+    },
+    Default {
+        #[serde(default)]
+        windows: Option<Vec<Window>>,
+        #[serde(default)]
+        unrestricted: Option<bool>,
+    },
 }
 
 /// How a `SaslLimitRule` selects which requests it applies to.
@@ -284,6 +306,21 @@ pub enum ConfigError {
     #[error("sasl must contain exactly one `type = \"default\"` rule, found {count}")]
     DefaultCount { count: usize },
     #[error(
+        "sasl[{index}] has no windows - a rule with nothing to check would silently exempt everything it matches \
+         from rate limiting. If this rule is meant to have no limit, set `unrestricted = true` instead."
+    )]
+    NoWindows { index: usize },
+    #[error(
+        "sasl[{index}] has both `windows` and `unrestricted = true` - remove `windows` if this rule should have no \
+         limit, or remove `unrestricted` if it should use those windows"
+    )]
+    WindowsWithUnrestricted { index: usize },
+    #[error(
+        "sasl[{index}] sets `unrestricted = false`, which has no effect alongside `windows` - omit the key \
+         entirely, or remove `windows` and set `unrestricted = true` to disable rate limiting for this rule instead"
+    )]
+    RedundantUnrestrictedFalse { index: usize },
+    #[error(
         "sasl[{index}] has a window duration of {duration:?}, but windows must be a whole number of seconds, at \
          least {MIN_WINDOW_DURATION:?}"
     )]
@@ -292,9 +329,13 @@ pub enum ConfigError {
     WindowTooLong { index: usize, duration: Duration },
 }
 
-/// Rejects any window whose duration isn't a whole number of seconds, or
-/// falls outside `[MIN_WINDOW_DURATION, MAX_WINDOW_DURATION]`.
+/// Rejects an empty `windows` list, or any window whose duration isn't a
+/// whole number of seconds or falls outside `[MIN_WINDOW_DURATION,
+/// MAX_WINDOW_DURATION]`.
 fn validate_windows(index: usize, windows: &[Window]) -> Result<(), ConfigError> {
+    if windows.is_empty() {
+        return Err(ConfigError::NoWindows { index });
+    }
     for window in windows {
         if window.duration.subsec_nanos() != 0 || window.duration < MIN_WINDOW_DURATION {
             return Err(ConfigError::WindowTooShort { index, duration: window.duration });
@@ -304,6 +345,36 @@ fn validate_windows(index: usize, windows: &[Window]) -> Result<(), ConfigError>
         }
     }
     Ok(())
+}
+
+/// Builds the `CheckPlan` for one rule's `windows`/`unrestricted` pair - an
+/// empty plan that never records anything and always permits, when
+/// `unrestricted` is explicitly `true`, or a validated plan built from
+/// `windows` otherwise.
+///
+/// `unrestricted = false` alongside real `windows` is rejected rather than
+/// accepted as a no-op: its effect there (use `windows` normally) is
+/// identical to simply omitting the key, so writing it out explicitly is far
+/// more likely to be a misunderstanding worth catching than a deliberate
+/// no-op worth silently accepting. `unrestricted = false` with no `windows`
+/// at all isn't a redundant annotation on otherwise-valid config, though -
+/// it's the same "nothing configured" problem as omitting both keys, so it's
+/// reported as that instead. `windows` set alongside `unrestricted = true` is
+/// rejected too, since having both leaves it unclear which one the reader
+/// should trust.
+fn build_plan(
+    index: usize, windows: Option<Vec<Window>>, unrestricted: Option<bool>,
+) -> Result<CheckPlan, ConfigError> {
+    match (windows, unrestricted) {
+        (None, Some(true)) => Ok(CheckPlan::new(&[])),
+        (Some(_), Some(true)) => Err(ConfigError::WindowsWithUnrestricted { index }),
+        (Some(_), Some(false)) => Err(ConfigError::RedundantUnrestrictedFalse { index }),
+        (Some(windows), None) => {
+            validate_windows(index, &windows)?;
+            Ok(CheckPlan::new(&windows))
+        }
+        (None, Some(false) | None) => Err(ConfigError::NoWindows { index }),
+    }
 }
 
 impl Config {
@@ -338,19 +409,17 @@ impl Config {
         let mut default_plan = None;
         for (index, rule) in raw.sasl_limits.into_iter().enumerate() {
             match rule {
-                RawSaslLimitRule::Username { username, windows } => {
-                    validate_windows(index, &windows)?;
-                    sasl_limits
-                        .push(SaslLimitRule { matcher: Matcher::Username(username), plan: CheckPlan::new(&windows) });
+                RawSaslLimitRule::Username { username, windows, unrestricted } => {
+                    let plan = build_plan(index, windows, unrestricted)?;
+                    sasl_limits.push(SaslLimitRule { matcher: Matcher::Username(username), plan });
                 }
-                RawSaslLimitRule::Regex { regex, windows } => {
-                    validate_windows(index, &windows)?;
+                RawSaslLimitRule::Regex { regex, windows, unrestricted } => {
+                    let plan = build_plan(index, windows, unrestricted)?;
                     let regex = Regex::new(&regex).map_err(|source| ConfigError::BadRegex { index, source })?;
-                    sasl_limits.push(SaslLimitRule { matcher: Matcher::Regex(regex), plan: CheckPlan::new(&windows) });
+                    sasl_limits.push(SaslLimitRule { matcher: Matcher::Regex(regex), plan });
                 }
-                RawSaslLimitRule::Default { windows } => {
-                    validate_windows(index, &windows)?;
-                    default_plan = Some(CheckPlan::new(&windows));
+                RawSaslLimitRule::Default { windows, unrestricted } => {
+                    default_plan = Some(build_plan(index, windows, unrestricted)?);
                 }
             }
         }
@@ -493,6 +562,77 @@ mod tests {
     fn window_duration_under_60s_is_rejected() {
         let toml = default_config(vec![window(1, "59s")]);
         assert!(matches!(load(toml), Err(ConfigError::WindowTooShort { index: 0, .. })));
+    }
+
+    #[test]
+    fn empty_windows_is_rejected() {
+        let toml = default_config(vec![]);
+        assert!(matches!(load(toml), Err(ConfigError::NoWindows { index: 0 })));
+    }
+
+    #[test]
+    fn unrestricted_true_is_accepted_and_matches_everything() {
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+
+            [[sasl]]
+            type = "username"
+            username = "alice"
+            unrestricted = true
+
+            [[sasl]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
+        let config = load(toml).expect("unrestricted = true should be accepted");
+        let plan = config.plan_for("alice");
+        assert!(plan.bucket_sizes.is_empty(), "an unrestricted plan should have no windows to check");
+    }
+
+    #[test]
+    fn unrestricted_false_alongside_windows_is_rejected() {
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+
+            [[sasl]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+            unrestricted = false
+        };
+        assert!(matches!(load(toml), Err(ConfigError::RedundantUnrestrictedFalse { index: 0 })));
+    }
+
+    #[test]
+    fn unrestricted_false_alone_is_rejected_as_no_windows() {
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+
+            [[sasl]]
+            type = "default"
+            unrestricted = false
+        };
+        assert!(matches!(load(toml), Err(ConfigError::NoWindows { index: 0 })));
+    }
+
+    #[test]
+    fn windows_alongside_unrestricted_true_is_rejected() {
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+
+            [[sasl]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+            unrestricted = true
+        };
+        assert!(matches!(load(toml), Err(ConfigError::WindowsWithUnrestricted { index: 0 })));
     }
 
     #[test]
