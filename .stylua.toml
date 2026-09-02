@@ -1,0 +1,7 @@
+# No real community consensus on Lua indentation exists (guides range from
+# tabs to 2/3/4 spaces) - kept at this project's own existing 4-space style
+# rather than StyLua's tab default. quote_style is left at StyLua's own
+# default (double quotes), which does match the genuine majority convention
+# across independent Lua style guides.
+indent_type = "Spaces"
+indent_width = 4

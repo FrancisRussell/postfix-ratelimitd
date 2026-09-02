@@ -31,7 +31,7 @@ local plan = request.plan
 local bucket_sizes = plan.bucket_sizes
 local num_keys = #bucket_sizes
 
-local now = request.now_override or tonumber(redis.call('TIME')[1])
+local now = request.now_override or tonumber(redis.call("TIME")[1])
 
 -- plan.windows' key_index is 0-based (matching bucket_sizes/limiter.rs);
 -- switch it to 1-based here, once, rather than adding 1 at every use below.
@@ -49,7 +49,7 @@ end
 local buckets_by_key = {}
 local min_id_by_key = {}
 for i = 1, num_keys do
-    local fields = redis.call('HGETALL', KEYS[i])
+    local fields = redis.call("HGETALL", KEYS[i])
     local buckets = {}
     local min_id = nil
     for j = 1, #fields, 2 do
@@ -91,9 +91,9 @@ end
 for i = 1, num_keys do
     local bucket_size = bucket_sizes[i]
     local bucket = math.floor(now / bucket_size)
-    redis.call('HINCRBY', KEYS[i], bucket, recipient_count)
+    redis.call("HINCRBY", KEYS[i], bucket, recipient_count)
     -- EXPIRE lets the key clean itself up via TTL if this sender goes quiet.
-    redis.call('EXPIRE', KEYS[i], plan.retention_secs[i])
+    redis.call("EXPIRE", KEYS[i], plan.retention_secs[i])
 
     local oldest = now - plan.retention_secs[i]
     local min_id = min_id_by_key[i]
@@ -104,7 +104,7 @@ for i = 1, num_keys do
                 stale[#stale + 1] = entry.id
             end
         end
-        redis.call('HDEL', KEYS[i], unpack(stale))
+        redis.call("HDEL", KEYS[i], unpack(stale))
     end
 end
 

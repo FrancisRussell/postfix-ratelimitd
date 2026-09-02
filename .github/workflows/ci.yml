@@ -69,6 +69,23 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  lua:
+    name: Lua
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install luacheck
+        run: sudo apt-get install -y --no-install-recommends lua-check
+      - name: Lint
+        run: luacheck lua/
+      - name: Install stylua
+        run: |
+          curl -sSL -o /tmp/stylua.zip https://github.com/JohnnyMorganz/StyLua/releases/download/v2.5.2/stylua-linux-x86_64.zip
+          unzip -o /tmp/stylua.zip -d /tmp/stylua-bin
+          chmod +x /tmp/stylua-bin/stylua
+      - name: Check formatting
+        run: /tmp/stylua-bin/stylua --check lua/
+
   check-licenses:
     name: Check licenses
     runs-on: ubuntu-latest
