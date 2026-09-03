@@ -143,10 +143,18 @@ impl Limiter {
     /// caching separately. `now_override` should only ever be `Some` from a
     /// request under the integration-tests feature - see
     /// `Request::now_override`.
+    ///
+    /// An unrestricted rule's plan has no bucket sizes at all (nothing to
+    /// check, nothing to record), so this returns `Ok(true)` immediately
+    /// without touching Redis/Valkey.
     #[allow(clippy::missing_panics_doc)] // the only panic is an internal invariant, not a caller-facing condition
     pub async fn check(
         &self, sasl_username: &str, recipient_count: u32, plan: &CheckPlan, now_override: Option<u64>,
     ) -> redis::RedisResult<bool> {
+        if plan.bucket_sizes.is_empty() {
+            return Ok(true);
+        }
+
         let mut connection = self.connection_manager.clone();
         let mut invocation = self.script.prepare_invoke();
 
