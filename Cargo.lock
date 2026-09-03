@@ -658,6 +658,7 @@ dependencies = [
  "clap",
  "env_logger",
  "humantime-serde",
+ "libc",
  "log",
  "redis",
  "regex-lite",

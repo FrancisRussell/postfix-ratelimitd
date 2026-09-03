@@ -72,6 +72,11 @@ const EXPECTED_PROTOCOL_STATE: &str = "DATA";
 const SOCKET_MODE: u32 = 0o660;
 const SOCKET_PROBE_PREFIX: &str = ".rl-check-";
 
+/// Forces a freshly created socket's default mode to owner-only, regardless
+/// of the ambient umask, by clearing every group/other bit a `bind()` call
+/// could otherwise leave set - see its use around the socket bind for why.
+const SOCKET_CREATE_UMASK: u32 = 0o177;
+
 /// Comfortably above realistic load, kept under common fd-limit defaults
 /// (~1024) for headroom.
 const MAX_CONNECTIONS: usize = 512;
@@ -433,11 +438,25 @@ async fn main() {
         fatal(format!("failed to remove stale socket {}: {err}", config.socket.display()));
     }
 
-    let listener = match UnixListener::bind(&config.socket) {
+    // A freshly bound socket briefly exists at bind()'s own default mode until
+    // the chmod below narrows it to SOCKET_MODE - narrowing the umask first
+    // (see SOCKET_CREATE_UMASK) makes that default owner-only regardless of
+    // the ambient umask, so the window is only ever more restrictive than
+    // SOCKET_MODE, never less.
+    // umask is process-wide state, not scoped to this thread, so this would be
+    // unsound to leave narrowed around anything that creates files without an
+    // explicit mode of its own on another task - nothing between the two
+    // umask calls here does that, only the bind() itself.
+    let previous_umask = unsafe { libc::umask(SOCKET_CREATE_UMASK) };
+    let listener = UnixListener::bind(&config.socket);
+    unsafe { libc::umask(previous_umask) };
+    let listener = match listener {
         Ok(listener) => listener,
         Err(err) => fatal(format!("failed to bind socket {}: {err}", config.socket.display())),
     };
-    // Access control is the install-time socket directory's job, not this file's.
+    // Access control is the install-time socket directory's job, not this file's -
+    // SOCKET_MODE only needs to be as tight as sharing the socket with Postfix's
+    // group requires, not to substitute for the directory's own restriction.
     if let Err(err) = std::fs::set_permissions(&config.socket, std::fs::Permissions::from_mode(SOCKET_MODE)) {
         fatal(format!("failed to set permissions on socket {}: {err}", config.socket.display()));
     }
