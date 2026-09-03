@@ -47,7 +47,7 @@ enum RawSaslLimitRule {
 
 /// How a `SaslLimitRule` selects which requests it applies to.
 #[derive(Debug, Clone)]
-pub enum Matcher {
+pub enum SaslMatcher {
     Username(String),
     Regex(Regex),
 }
@@ -55,7 +55,7 @@ pub enum Matcher {
 /// A matcher paired with the plan to enforce against whatever it matches.
 #[derive(Debug, Clone)]
 pub struct SaslLimitRule {
-    pub matcher: Matcher,
+    pub matcher: SaslMatcher,
     pub plan: CheckPlan,
 }
 
@@ -63,8 +63,8 @@ impl SaslLimitRule {
     /// Returns whether this rule applies to `sasl_username`.
     pub fn matches(&self, sasl_username: &str) -> bool {
         match &self.matcher {
-            Matcher::Username(username) => username == sasl_username,
-            Matcher::Regex(regex) => regex.is_match(sasl_username),
+            SaslMatcher::Username(username) => username == sasl_username,
+            SaslMatcher::Regex(regex) => regex.is_match(sasl_username),
         }
     }
 }
@@ -328,6 +328,7 @@ fn validate_windows(index: usize, windows: &[Window]) -> Result<(), ConfigError>
     if windows.is_empty() {
         return Err(ConfigError::NoWindows { index });
     }
+    // Does this correctly validate the window is a whole numebr of seconds.
     for window in windows {
         if window.duration.subsec_nanos() != 0 || window.duration < MIN_WINDOW_DURATION {
             return Err(ConfigError::WindowTooShort { index, duration: window.duration });
@@ -403,12 +404,12 @@ impl Config {
             match rule {
                 RawSaslLimitRule::Username { username, windows, unrestricted } => {
                     let plan = build_plan(index, windows, unrestricted)?;
-                    sasl_limits.push(SaslLimitRule { matcher: Matcher::Username(username), plan });
+                    sasl_limits.push(SaslLimitRule { matcher: SaslMatcher::Username(username), plan });
                 }
                 RawSaslLimitRule::Regex { regex, windows, unrestricted } => {
                     let plan = build_plan(index, windows, unrestricted)?;
                     let regex = Regex::new(&regex).map_err(|source| ConfigError::BadRegex { index, source })?;
-                    sasl_limits.push(SaslLimitRule { matcher: Matcher::Regex(regex), plan });
+                    sasl_limits.push(SaslLimitRule { matcher: SaslMatcher::Regex(regex), plan });
                 }
                 RawSaslLimitRule::Default { windows, unrestricted } => {
                     default_plan = Some(build_plan(index, windows, unrestricted)?);

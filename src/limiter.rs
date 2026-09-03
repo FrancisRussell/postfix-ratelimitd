@@ -109,7 +109,7 @@ pub async fn check_command_support(connection: &mut ConnectionManager, commands:
 
 /// Checks and records recipient counts against Valkey via
 /// `check_and_record.lua`.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Limiter {
     connection_manager: ConnectionManager,
     key_prefix: String,

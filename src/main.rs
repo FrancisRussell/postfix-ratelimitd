@@ -1,7 +1,7 @@
 #![warn(clippy::pedantic)]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 /// Where to send log output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum LogTarget {
     /// Formatted lines to stdout, timestamped since nothing else will be -
     /// unlike syslog, nothing here can assume a journald (or other) receiver
@@ -57,7 +57,7 @@ struct Cli {
     syslog_ident: Option<String>,
 
     /// Minimum severity to log: off, error, warn, info, debug, or trace
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value_t = log::LevelFilter::Info)]
     log_level: log::LevelFilter,
 }
 
@@ -277,6 +277,7 @@ async fn handle_connection(
 
 /// Releases its connection's slot in `ACTIVE_CONNECTIONS`, even if the task
 /// panics.
+#[derive(Debug)]
 struct ConnectionGuard;
 
 impl Drop for ConnectionGuard {
@@ -285,10 +286,10 @@ impl Drop for ConnectionGuard {
 
 /// Verifies a unix socket can be created in the socket's directory, without
 /// touching the configured socket path itself.
-fn check_socket_directory(socket: &std::path::Path) -> std::io::Result<()> {
+fn check_socket_directory(socket: &Path) -> std::io::Result<()> {
     let dir = match socket.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => std::path::Path::new("."),
+        _ => Path::new("."),
     };
     let probe = dir.join(format!("{SOCKET_PROBE_PREFIX}{}", std::process::id()));
     std::os::unix::net::UnixListener::bind(&probe)?;
@@ -306,7 +307,7 @@ fn check_socket_directory(socket: &std::path::Path) -> std::io::Result<()> {
 /// (if anything) is safe to remove and rebind: a stale socket file left
 /// behind by a process that didn't exit cleanly refuses connections rather
 /// than accepting them.
-fn socket_is_live(socket: &std::path::Path) -> bool {
+fn socket_is_live(socket: &Path) -> bool {
     match std::os::unix::net::UnixStream::connect(socket) {
         Ok(_) => true,
         Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
@@ -361,7 +362,10 @@ async fn shutdown_requested() {
 }
 
 /// Whether `a` and `b` would make [`Limiter::new`] connect to the same place
-/// with the same credentials.
+/// with the same credentials. `ConnectionInfo` has no `PartialEq` of its own
+/// to defer to, and a derived one wouldn't fit anyway: it would also compare
+/// fields like `lib_name`/`lib_ver` that have no bearing on whether reload
+/// can skip rebuilding `Limiter`.
 fn same_redis_connection(a: &ConnectionInfo, b: &ConnectionInfo) -> bool {
     let (a_redis, b_redis) = (a.redis_settings(), b.redis_settings());
     a.addr() == b.addr()
@@ -380,7 +384,7 @@ fn same_redis_connection(a: &ConnectionInfo, b: &ConnectionInfo) -> bool {
 /// that only succeeds if the new one actually connects, and if it doesn't,
 /// the whole reload is rejected (nothing swaps) so `config` can never
 /// disagree with the `Limiter` actually in use.
-async fn reload_config(path: &std::path::Path, config: &ArcSwap<Config>, limiter: &ArcSwap<Limiter>) {
+async fn reload_config(path: &Path, config: &ArcSwap<Config>, limiter: &ArcSwap<Limiter>) {
     let current = config.load_full();
     let new_config = match Config::load(path) {
         Ok(config) => config,
