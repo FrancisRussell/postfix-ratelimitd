@@ -698,8 +698,7 @@ fn window_lifecycle_at_the_minimum_duration_extreme() {
 fn window_lifecycle_at_the_maximum_duration_extreme() {
     let valkey = ValkeyInstance::start_unix();
     // 31d is MAX_WINDOW_DURATION; it lands on a 32768s bucket (not yet
-    // MAX_BUCKET_SIZE's clamp - see its own doc comment), giving a span_secs
-    // of 2,686,976s (~31.09d, not the nominal 2,678,400s) - see
+    // MAX_BUCKET_SIZE's clamp - see its own doc comment) - see
     // config::tests::bucket_size_at_max_window_duration_does_not_yet_reach_the_clamp.
     let config = default_sasl_config(1, "31d");
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
@@ -715,7 +714,8 @@ fn window_lifecycle_at_the_maximum_duration_extreme() {
         "a second message in the same instant should be rejected"
     );
 
-    // Past the actual ~31.09d span, not just the nominal 31 days.
+    // Past the window's 31d duration, with more than enough margin to clear
+    // the worst-case bucket-boundary overcount (at most one 32768s bucket).
     let response = daemon.request_at("alice", 1, base_now + 33 * 24 * 60 * 60);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the message should have aged out of the 31d window");
 }
@@ -725,10 +725,10 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
     let valkey = ValkeyInstance::start_unix();
     // A 19d and a 31d window both land on a 32768s bucket (see
     // window_lifecycle_at_the_maximum_duration_extreme) and so share one
-    // Redis key, but their own spans differ (~19.34d vs ~31.09d) - the shared
-    // key's retention (and prune cutoff) is the longer of the two, so an
-    // entry can correctly stop counting against the 19d window's own limit
-    // long before it's actually deleted.
+    // Redis key, but their own spans differ (19d vs 31d) - the shared key's
+    // retention (and prune cutoff) is the longer of the two, so an entry can
+    // correctly stop counting against the 19d window's own limit long before
+    // it's actually deleted.
     let config = default_sasl_config_multi(vec![window(1, "19d"), window(5, "31d")]);
     let base_now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
 
@@ -736,9 +736,9 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
     let response = daemon.request_at("alice", 1, base_now);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit both empty windows");
 
-    // 25 days later: past the 19d window's own ~19.34d span, but well before
-    // the shared key's ~31.09d retention. If the 19d window incorrectly used
-    // the shared key's longer retention as its own cutoff instead of its own
+    // 25 days later: past the 19d window's own span, but well before the
+    // shared key's 31d retention. If the 19d window incorrectly used the
+    // shared key's longer retention as its own cutoff instead of its own
     // span, this message would push its count-1 limit to 2 and be rejected.
     let response = daemon.request_at("alice", 1, base_now + 25 * 24 * 60 * 60);
     assert_eq!(
@@ -830,14 +830,12 @@ fn overcount_bound_holds_against_real_recorded_data() {
         "a message must still count exactly at its window's true duration"
     );
 
-    // Two independent sources of overcount stack here: the retained span can
-    // exceed duration by up to duration/BUCKET_TARGET_COUNT (the ceiling
-    // guarantee), and the bucketing scheme adds up to one more bucket's worth
-    // of slack depending on where within its own bucket the message lands -
-    // not under this test's control, since base_now is seeded from the real
-    // clock. bucket_size is itself bounded by that same
-    // duration/BUCKET_TARGET_COUNT quantity, so doubling it safely covers both.
-    let worst_case_slack = 2 * (duration_secs / BUCKET_TARGET_COUNT);
+    // A boundary bucket is counted in full as soon as any part of it is
+    // still within the window, so a message can be overcounted by up to one
+    // bucket's worth of slack depending on where within its own bucket it
+    // lands - not under this test's control, since base_now is seeded from
+    // the real clock. bucket_size is bounded by duration/BUCKET_TARGET_COUNT.
+    let worst_case_slack = duration_secs / BUCKET_TARGET_COUNT;
     let response = daemon.request_at("alice", 1, base_now + duration_secs + worst_case_slack + 1);
     assert_eq!(
         response,

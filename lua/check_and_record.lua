@@ -21,9 +21,7 @@
 --     windows: one { key_index, span_secs, limit } object per configured
 --       window. key_index arrives 0-based (matching bucket_sizes/limiter.rs);
 --       this script switches it to 1-based right after decoding, below.
---       span_secs is the window's duration rounded up to a whole number of
---       buckets (computed once from config, not here, since it doesn't
---       depend on anything in KEYS).
+--       span_secs is the window's configured duration in seconds.
 
 local request = cjson.decode(ARGV[1])
 local recipient_count = request.recipient_count

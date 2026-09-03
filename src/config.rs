@@ -127,18 +127,11 @@ pub(crate) fn bucket_size(duration: Duration) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// The number of `bucket_size(duration)`-sized buckets needed to cover
-/// `duration`, rounded up so a boundary bucket only partially within the
-/// window is still counted in full rather than dropped.
-pub(crate) fn lookback_buckets(duration: Duration) -> u64 {
-    duration.as_secs().div_ceil(bucket_size(duration).as_secs())
-}
-
 /// One window's position within a [`CheckPlan`]: which of its
-/// `bucket_sizes` entries it shares, its retention span in seconds
-/// (`duration` rounded up to a whole number of buckets), and its recipient
-/// limit. Sent to `check_and_record.lua` as JSON, so field names are part of
-/// that script's contract - see its ARGV comment.
+/// `bucket_sizes` entries it shares, its span in seconds (the window's
+/// configured duration), and its recipient limit. Sent to
+/// `check_and_record.lua` as JSON, so field names are part of that script's
+/// contract - see its ARGV comment.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct PlannedWindow {
     pub key_index: usize,
@@ -178,15 +171,14 @@ impl CheckPlan {
     /// Builds a plan from a rule's windows - see the `CheckPlan` docs above.
     ///
     /// Two windows are checked against the exact same accumulated total
-    /// exactly when both their `key_index` and `span_secs` match - neither
-    /// alone is enough, since different bucket sizes can add up to the same
-    /// span by coincidence, and windows sharing a bucket size can still need
-    /// different retentions. Same `duration` guarantees both match (they're
-    /// pure functions of it); different durations occasionally land on both
-    /// too, by rounding up to the same bucket size and span. Either way,
-    /// only the stricter (lower) of the matching limits can ever be the one
-    /// that rejects, so the other is folded in rather than kept as a
-    /// redundant entry.
+    /// exactly when their `span_secs` match - `span_secs` is just the
+    /// window's own configured duration, and bucket size is a pure function
+    /// of duration, so matching `span_secs` already guarantees matching
+    /// `key_index` too; the reverse doesn't hold, since windows sharing a
+    /// bucket size can still need different retentions. Either way, only
+    /// the stricter (lower) of the matching limits can ever be the one that
+    /// rejects, so the other is folded in rather than kept as a redundant
+    /// entry.
     fn new(windows: &[Window]) -> CheckPlan {
         let mut bucket_sizes: Vec<u64> = Vec::new();
         let mut retention_secs: Vec<u64> = Vec::new();
@@ -198,7 +190,7 @@ impl CheckPlan {
                 retention_secs.push(0);
                 bucket_sizes.len() - 1
             });
-            let span_secs = lookback_buckets(window.duration) * size;
+            let span_secs = window.duration.as_secs();
             retention_secs[key_index] = retention_secs[key_index].max(span_secs);
 
             match planned_windows.iter_mut().find(|w| w.key_index == key_index && w.span_secs == span_secs) {
@@ -644,7 +636,6 @@ mod tests {
     #[test]
     fn bucket_size_hits_target_count_at_min_window_duration() {
         assert_eq!(bucket_size(MIN_WINDOW_DURATION), MIN_BUCKET_SIZE);
-        assert_eq!(lookback_buckets(MIN_WINDOW_DURATION), 60);
     }
 
     #[test]
@@ -657,30 +648,25 @@ mod tests {
         // makes 65536s reachable again is a deliberate, visible decision, not
         // a silent side effect.
         assert_eq!(bucket_size(MAX_WINDOW_DURATION), Duration::from_secs(32768));
-        assert_eq!(lookback_buckets(MAX_WINDOW_DURATION), 82);
     }
 
     #[test]
-    fn bucket_size_never_overcounts_by_more_than_the_target_fraction() {
-        // The two guarantees bucket_size/lookback_buckets exist to provide, for every
-        // valid window duration, whether or not it lands exactly on a ladder rung's
-        // boundary: at least BUCKET_TARGET_COUNT buckets, and a retained span (rounding
-        // duration up to a whole number of buckets, since a partially-elapsed boundary
-        // bucket always counts in full) that overcounts by no more than
-        // 1/BUCKET_TARGET_COUNT (2%) of the window's own duration. Exhaustive over
-        // every second in the valid range rather than sampled, since it's cheap
-        // enough (milliseconds) not to need to be.
+    fn bucket_size_never_exceeds_the_target_fraction_of_duration() {
+        // check_and_record.lua counts a boundary bucket in full as soon as
+        // any part of it is still within the window, which can overcount a
+        // window by up to one bucket_size. This is the guarantee that keeps
+        // that overcount bounded to no more than 1/BUCKET_TARGET_COUNT (2%)
+        // of the window's own duration, for every valid window duration
+        // whether or not it lands exactly on a ladder rung's boundary.
+        // Exhaustive over every second in the valid range rather than
+        // sampled, since it's cheap enough (milliseconds) not to need to be.
         let mut duration = MIN_WINDOW_DURATION;
         while duration <= MAX_WINDOW_DURATION {
             let secs = duration.as_secs();
             let size = bucket_size(duration).as_secs();
-            let buckets = lookback_buckets(duration);
-            assert!(buckets >= BUCKET_TARGET_COUNT, "{duration:?} only gets {buckets} buckets");
-
-            let overcount = buckets * size - secs;
             assert!(
-                overcount * BUCKET_TARGET_COUNT <= secs,
-                "{duration:?} overcounts by {overcount}s, exceeding the 1/{BUCKET_TARGET_COUNT} bound"
+                size * BUCKET_TARGET_COUNT <= secs,
+                "{duration:?} has bucket_size {size}s, exceeding the 1/{BUCKET_TARGET_COUNT} bound"
             );
             duration += Duration::from_secs(1);
         }
@@ -703,10 +689,10 @@ mod tests {
         // Chosen because they land on the same bucket size (checked below as
         // the test's premise, not assumed), so they share one key - its
         // retention must cover the longer (4200s) window, not just the first
-        // one seen. Expected spans/retention are derived from the real
-        // bucket_size/lookback_buckets functions rather than hardcoded, so
-        // this keeps testing the same property under any legitimate retuning
-        // of BUCKET_TARGET_COUNT or the bucket-size ladder.
+        // one seen. The shared bucket size is derived from the real
+        // bucket_size function rather than hardcoded, so this keeps testing
+        // the same property under any legitimate retuning of
+        // BUCKET_TARGET_COUNT or the bucket-size ladder.
         let short = Duration::from_hours(1);
         let long = Duration::from_mins(70);
         assert_eq!(bucket_size(short), bucket_size(long), "test premise: both durations should share a bucket size");
@@ -716,11 +702,9 @@ mod tests {
         let plan = config.plan_for("anyone");
         assert_eq!(plan.bucket_sizes, vec![bucket_size(short).as_secs()], "both windows should share one bucket size");
 
-        let short_span = lookback_buckets(short) * bucket_size(short).as_secs();
-        let long_span = lookback_buckets(long) * bucket_size(long).as_secs();
-        assert_eq!(plan.windows[0].span_secs, short_span);
-        assert_eq!(plan.windows[1].span_secs, long_span);
-        assert_eq!(plan.retention_secs, vec![long_span], "retention must cover the longer window's span");
+        assert_eq!(plan.windows[0].span_secs, short.as_secs());
+        assert_eq!(plan.windows[1].span_secs, long.as_secs());
+        assert_eq!(plan.retention_secs, vec![long.as_secs()], "retention must cover the longer window's span");
     }
 
     #[test]
