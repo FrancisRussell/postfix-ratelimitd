@@ -295,6 +295,24 @@ fn check_socket_directory(socket: &std::path::Path) -> std::io::Result<()> {
     std::fs::remove_file(&probe)
 }
 
+/// Whether another process is already listening on `socket`, or this process
+/// can't tell either way. Connecting succeeds as soon as a listener exists
+/// (it doesn't need to `accept()` this specific connection first), so a
+/// successful connect is an unambiguous live signal. A permission error is
+/// inconclusive rather than a live signal in its own right, but is treated
+/// the same way (refuse to proceed) since removing and rebinding on an
+/// unverifiable guess risks silently orphaning a real listener. Every other
+/// failure, including the path not existing at all, means whatever's there
+/// (if anything) is safe to remove and rebind: a stale socket file left
+/// behind by a process that didn't exit cleanly refuses connections rather
+/// than accepting them.
+fn socket_is_live(socket: &std::path::Path) -> bool {
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => true,
+        Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
+    }
+}
+
 /// Logs `message` as an error and exits the process; for unrecoverable startup
 /// failures.
 fn fatal(message: impl std::fmt::Display) -> ! {
@@ -431,6 +449,17 @@ async fn main() {
         Ok(limiter) => limiter,
         Err(err) => fatal(format!("failed to initialize valkey client: {err}")),
     };
+
+    // Narrows, but doesn't close, the window for two instances starting at
+    // the same time to both see no listener here and both proceed - closing
+    // that fully would need a lock file, which this daemon doesn't otherwise
+    // need and isn't worth adding just to cover that unlikely a race.
+    if socket_is_live(&config.socket) {
+        fatal(format!(
+            "refusing to start: {} is either already listening, or its permissions couldn't be verified",
+            config.socket.display()
+        ));
+    }
 
     if let Err(err) = std::fs::remove_file(&config.socket)
         && err.kind() != std::io::ErrorKind::NotFound

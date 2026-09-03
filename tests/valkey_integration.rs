@@ -6,7 +6,7 @@
 //! tests need no privileges beyond running the `valkey-server` binary and never
 //! touch anything but their own private instance.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
@@ -376,6 +376,51 @@ async fn check_command_support_reports_missing_commands() {
         .await
         .expect_err("a made-up command name should be reported as missing");
     assert!(err.to_string().contains(FAKE_COMMAND));
+}
+
+#[test]
+fn a_second_instance_refuses_to_start_while_the_first_is_still_listening() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(&valkey, default_sasl_config(1, "60s"));
+
+    // A second config pointed at the same socket, built by hand rather than
+    // through Daemon::start_with_env, since that always allocates its own
+    // fresh tempdir/socket - the whole point here is reusing the first
+    // instance's already-live one.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("config.toml");
+    let mut config = default_sasl_config(1, "60s");
+    set_default(&mut config, "redis", "url", valkey.redis_url());
+    set_default(&mut config, "redis", "db", 0i64);
+    set_default(&mut config, "server", "socket", daemon.socket.display().to_string());
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+
+    let mut second = Command::new(env!("CARGO_BIN_EXE_postfix-ratelimitd"))
+        .arg("--config")
+        .arg(&config_path)
+        .env(INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR, "1")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn second daemon");
+
+    let deadline = Instant::now() + READY_TIMEOUT;
+    let status = loop {
+        if let Some(status) = second.try_wait().expect("poll second daemon") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "second instance should have refused to start and exited by now");
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    assert!(!status.success(), "a second instance should refuse to start, not exit cleanly");
+
+    let mut stderr = String::new();
+    second.stderr.take().expect("captured stderr").read_to_string(&mut stderr).expect("read stderr");
+    assert!(stderr.contains("already listening"), "expected a clear refusal message, got: {stderr}");
+
+    // The first instance's own socket must be completely unaffected by the
+    // second instance's failed startup attempt.
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 }
 
 #[test]
