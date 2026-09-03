@@ -52,7 +52,9 @@ warn_on_unauthenticated = true
 # Rules matching against the SASL username, evaluated top-to-bottom; the
 # first match wins. Exactly one `type = "default"` rule must be present, as
 # the fallback when nothing else matches. Each window's duration must be a
-# whole number of seconds, at least 60s and at most 31 days.
+# whole number of seconds, at least 60s and at most 31 days. A rule can opt
+# out of rate limiting entirely with `unrestricted = true` instead of
+# `windows`.
 
 #[[sasl]]
 #type = "username"
@@ -68,6 +70,11 @@ warn_on_unauthenticated = true
 #windows = [
 #    { count = 10, duration = "1h" },
 #]
+
+#[[sasl]]
+#type = "username"
+#username = "monitoring"
+#unrestricted = true
 
 [[sasl]]
 type = "default"
