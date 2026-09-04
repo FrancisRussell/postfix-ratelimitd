@@ -109,33 +109,39 @@ this way - that requires a restart.
 
 ## Postfix wiring
 
-This goes on the `submission` service block in `master.cf` only - this
-mechanism only applies to authenticated senders, so it has no place on the
-plain inbound `smtp` service:
+This goes on the `submission` service block in `master.cf` only. This
+mechanism only applies to authenticated senders, so it should not be on
+the plain inbound `smtp` service:
 
 ```
--o smtpd_data_restrictions=check_policy_service { unix:/run/postfix-ratelimitd/ratelimit.sock, { default_action = defer_if_permit Service temporarily unavailable } }
+-o { smtpd_data_restrictions = check_policy_service { unix:/run/postfix-ratelimitd/ratelimit.sock, { default_action = defer_if_permit Rate-limit service temporarily unavailable } } }
 ```
 
-(If `server.socket` points under `/var/spool/postfix` instead, as noted above,
-reference it here as a path relative to Postfix's queue directory rather than
-by absolute path - `unix:postfix-ratelimitd/ratelimit.sock`.)
+**Important:** The argument contains whitespace, so it needs
+`master.cf`'s long-form `-o { name = value }` override syntax rather than
+the short `-o name=value` form, which silently splits on whitespace into
+separate command-line arguments. If there is a mistake, neither `postfix
+check` nor `postfix start`/`reload` will catch the resulting failure - it
+will only surface on the next actual mail delivery attempt through this
+service. This is an extremely easy way to break outgoing mail with none of
+the usual validation mechanisms raising any sort of warning.
 
-This **must** be wired into `smtpd_data_restrictions` (as above) or
-`smtpd_end_of_data_restrictions` - only at those two stages has Postfix seen
-all recipients. `smtpd_data_restrictions` is the better choice: it rejects
-before the client uploads the message body, while
-`smtpd_end_of_data_restrictions` rejects after, wasting that upload for a
-message that was always going to be deferred. If it's wired to any other
-restriction class instead, the daemon defers every request with "Rate limit
-service misconfigured" rather than risk enforcing limits against a wrong or
-partial recipient count, and logs an error naming the unexpected
-`protocol_state`.
+If `server.socket` points under `/var/spool/postfix` instead, as noted
+above, reference it here as a path relative to Postfix's queue directory
+rather than by absolute path - `unix:postfix-ratelimitd/ratelimit.sock`.
 
-The nested `default_action` covers the case where Postfix can't reach the
-daemon's socket at all (it's down, or crashed); the daemon's own responses
-cover every case where it *is* reachable but the check itself failed or hit
-the limit.
+The rate limiter **must** be wired into `smtpd_data_restrictions` (as
+above) or `smtpd_end_of_data_restrictions` - only at those two stages has
+Postfix seen all recipients. `smtpd_data_restrictions` is the better
+choice because it rejects before the client uploads the message body. If
+it is wired to any other restriction class, the daemon defers every
+request with "Rate limit service misconfigured" rather than risk
+enforcing limits against a wrong or partial recipient count.
+
+The `default_action` covers Postfix being unable to reach the daemon. If
+the daemon is reachable but the check itself fails (e.g. Valkey is
+unreachable) the daemon returns its own response instead, either a defer
+or permit depending on the value of `on_redis_error`.
 
 ## Usage
 
