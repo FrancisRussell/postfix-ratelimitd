@@ -59,7 +59,8 @@ impl Request {
         self.attributes.get("sasl_username").map(|s| s.trim()).filter(|s| !s.is_empty())
     }
 
-    /// The message's final recipient count, sent at the DATA stage.
+    /// The message's final recipient count, sent at the DATA and
+    /// END-OF-MESSAGE stages.
     #[must_use]
     pub fn recipient_count(&self) -> Option<u32> { self.attributes.get("recipient_count")?.parse().ok() }
 
