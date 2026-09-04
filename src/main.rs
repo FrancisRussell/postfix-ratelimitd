@@ -61,9 +61,13 @@ struct Cli {
     log_level: log::LevelFilter,
 }
 
-/// Expected `protocol_state` for this daemon per its `smtpd_data_restrictions`
-/// wiring.
-const EXPECTED_PROTOCOL_STATE: &str = "DATA";
+/// Protocol states this daemon accepts requests at, per its
+/// `smtpd_data_restrictions`/`smtpd_end_of_data_restrictions` wiring - both
+/// populate `recipient_count` with the message's final total, differing only
+/// in whether Postfix has already accepted the message body (END-OF-MESSAGE)
+/// or not yet (DATA - the cheaper of the two to reject at, since a client
+/// never uploads a body that was always going to be rejected).
+const EXPECTED_PROTOCOL_STATES: [&str; 2] = ["DATA", "END-OF-MESSAGE"];
 
 /// Owner and group get read-write access, nobody else does - restricting who
 /// can reach the socket to whichever group the deploying systemd unit puts
@@ -171,12 +175,12 @@ fn log_throttled(counter: &AtomicU64, kind: &str, log_line: impl FnOnce()) {
 
 /// Decides the policy action to return for one request.
 async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -> &'static str {
-    if request.protocol_state().is_some_and(|state| state != EXPECTED_PROTOCOL_STATE) {
-        log_throttled(&STATS.misconfigured, "smtpd_data_restrictions wiring", || {
+    if request.protocol_state().is_some_and(|state| !EXPECTED_PROTOCOL_STATES.contains(&state)) {
+        log_throttled(&STATS.misconfigured, "smtpd_data_restrictions/smtpd_end_of_data_restrictions wiring", || {
             log::error!(
-                "policy request at protocol_state {:?}, expected {EXPECTED_PROTOCOL_STATE:?} - check \
-                 smtpd_data_restrictions wiring; deferring rather than risk enforcing limits against a wrong or \
-                 partial recipient_count",
+                "policy request at protocol_state {:?}, expected one of {EXPECTED_PROTOCOL_STATES:?} - check \
+                 smtpd_data_restrictions/smtpd_end_of_data_restrictions wiring; deferring rather than risk \
+                 enforcing limits against a wrong or partial recipient_count",
                 request.protocol_state()
             );
         });
@@ -185,10 +189,10 @@ async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -
 
     let Some(sasl_username) = request.sasl_username() else {
         // Always permitted - there's no identity to rate-limit against - but logged
-        // (unless silenced via warn_on_unauthenticated) since it usually means
-        // smtpd_data_restrictions is wired somewhere it shouldn't be. The counter
-        // always increments either way, so the periodic stats line stays accurate
-        // even with warnings silenced or throttled.
+        // (unless silenced via warn_on_unauthenticated) since it usually means this
+        // is wired somewhere it shouldn't be. The counter always increments either
+        // way, so the periodic stats line stays accurate even with warnings
+        // silenced or throttled.
         if config.warn_on_unauthenticated {
             log_throttled(&STATS.unauthenticated, "unauthenticated request", || {
                 log::warn!("policy request has no SASL username - check this is wired to an authenticated service");
@@ -199,13 +203,13 @@ async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -
         return ACTION_DUNNO;
     };
     let Some(recipient_count) = request.recipient_count() else {
-        // Same root cause as the protocol_state check above - smtpd_data_restrictions
-        // is the only restriction class that populates recipient_count, so a
+        // Same root cause as the protocol_state check above - DATA and END-OF-MESSAGE
+        // are the only protocol states that populate recipient_count, so a
         // well-wired deployment never reaches this.
-        log_throttled(&STATS.misconfigured, "smtpd_data_restrictions wiring", || {
+        log_throttled(&STATS.misconfigured, "smtpd_data_restrictions/smtpd_end_of_data_restrictions wiring", || {
             log::error!(
-                "policy request for {sasl_username} is missing recipient_count - check smtpd_data_restrictions \
-                 wiring"
+                "policy request for {sasl_username} is missing recipient_count - check \
+                 smtpd_data_restrictions/smtpd_end_of_data_restrictions wiring"
             );
         });
         return ACTION_MISCONFIGURED;

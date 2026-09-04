@@ -486,12 +486,26 @@ fn wrong_protocol_state_defers_without_checking() {
 }
 
 #[test]
+fn end_of_message_protocol_state_is_checked_the_same_as_data() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start(&valkey, default_sasl_config(1, "60s"));
+
+    let response = daemon.raw_request("sasl_username=alice\nrecipient_count=1\nprotocol_state=END-OF-MESSAGE\n\n");
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"), "the first message should fit an empty window");
+
+    // Proves this was actually recorded against the real limit, not silently
+    // ignored - a second message over the count-1 limit must now be rejected.
+    let response = daemon.raw_request("sasl_username=alice\nrecipient_count=1\nprotocol_state=END-OF-MESSAGE\n\n");
+    assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"), "the window's limit should already be full");
+}
+
+#[test]
 fn missing_recipient_count_defers_without_checking() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(&valkey, default_sasl_config(50, "1h"));
 
-    // Same root cause as a wrong protocol_state - only smtpd_data_restrictions
-    // populates recipient_count.
+    // Same root cause as a wrong protocol_state - only DATA and END-OF-MESSAGE
+    // populate recipient_count.
     let response = daemon.raw_request("sasl_username=alice\nprotocol_state=DATA\n\n");
     assert_eq!(response, format!("action={ACTION_MISCONFIGURED}\n\n"));
 

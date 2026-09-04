@@ -121,8 +121,12 @@ plain inbound `smtp` service:
 reference it here as a path relative to Postfix's queue directory rather than
 by absolute path - `unix:postfix-ratelimitd/ratelimit.sock`.)
 
-This **must** be wired into `smtpd_data_restrictions`, since only at the
-`DATA` stage has Postfix seen all recipients. If it's wired to any other
+This **must** be wired into `smtpd_data_restrictions` (as above) or
+`smtpd_end_of_data_restrictions` - only at those two stages has Postfix seen
+all recipients. `smtpd_data_restrictions` is the better choice: it rejects
+before the client uploads the message body, while
+`smtpd_end_of_data_restrictions` rejects after, wasting that upload for a
+message that was always going to be deferred. If it's wired to any other
 restriction class instead, the daemon defers every request with "Rate limit
 service misconfigured" rather than risk enforcing limits against a wrong or
 partial recipient count, and logs an error naming the unexpected
