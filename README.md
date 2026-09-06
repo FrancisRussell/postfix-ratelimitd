@@ -202,6 +202,19 @@ at all - see [Postfix wiring](#postfix-wiring); either means this daemon is
 wired to the wrong restriction class, which should never happen in a working
 deployment and is logged as an error immediately rather than tallied.
 
+## Multiple instances
+
+Multiple instances rate-limiting the same senders against a single
+Valkey/Redis backend haven't been tested, but should work correctly *if*
+every instance uses an identical window configuration. If they don't, no
+data will be corrupted, but enforcement will become inconsistent. Some
+limits may get enforced per-instance rather than globally, and some time
+windows may undercount the number of messages.
+
+Instances rate-limiting entirely unrelated senders are safe sharing one
+Valkey/Redis backend as long as each uses its own `key_prefix` and/or
+`redis.db`.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
