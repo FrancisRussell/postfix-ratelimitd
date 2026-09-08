@@ -22,20 +22,19 @@ use tokio_util::task::TaskTracker;
 /// Where to send log output.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum LogTarget {
-    /// Formatted lines to stdout, timestamped since nothing else will be -
-    /// unlike syslog, nothing here can assume a journald (or other) receiver
-    /// is stamping each line for us. The default: safe for local runs,
-    /// containers, and anywhere else not necessarily wired to a syslog socket.
+    /// Timestamped lines to stdout
+    // The default - unlike syslog, nothing here can assume a journald (or
+    // other) receiver is stamping each line for us. Safe for local runs,
+    // containers, and anywhere else not necessarily wired to a syslog socket.
     Stdout,
-    /// RFC 3164 syslog via /dev/log. Works under journald, which preserves
-    /// priority and unit attribution for messages received this way the same
-    /// as for native journal capture, or under a standalone rsyslog/syslog-ng.
-    /// Unlike a systemd-specific journal integration, this needs nothing
-    /// systemd-specific to work.
+    /// RFC 3164 syslog via /dev/log
+    // Works under journald, which preserves priority and unit attribution
+    // for messages received this way the same as for native journal capture,
+    // or under a standalone rsyslog/syslog-ng - unlike a systemd-specific
+    // journal integration, this needs nothing systemd-specific to work.
     Syslog,
 }
 
-/// Command-line arguments for the daemon.
 #[derive(Debug, Clone, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -56,7 +55,7 @@ struct Cli {
     #[arg(long)]
     syslog_ident: Option<String>,
 
-    /// Minimum severity to log: off, error, warn, info, debug, or trace
+    /// Minimum severity to log: OFF, ERROR, WARN, INFO, DEBUG, or TRACE (case-insensitive)
     #[arg(long, default_value_t = log::LevelFilter::Info)]
     log_level: log::LevelFilter,
 }

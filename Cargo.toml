@@ -3,6 +3,7 @@ name = "postfix-ratelimitd"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+description = "Postfix SMTP access policy daemon that rate-limits recipients, backed by Valkey/Redis."
 
 [dependencies]
 arc-swap = "1"
