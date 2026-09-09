@@ -2,6 +2,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -15,7 +16,7 @@ use postfix_ratelimitd::{ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED
 use redis::ConnectionInfo;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -317,11 +318,14 @@ fn socket_is_live(socket: &Path) -> bool {
     }
 }
 
-/// Logs `message` as an error and exits the process; for unrecoverable startup
-/// failures.
-fn fatal(message: impl std::fmt::Display) -> ! {
+/// Logs `message` for an unrecoverable startup failure and returns the
+/// failure `ExitCode` for `main` to return - letting `main` return normally,
+/// rather than calling `std::process::exit`, so everything already
+/// constructed (the Redis connection, the bound listener) still runs its
+/// `Drop` glue, instead of the process being torn down out from under it.
+fn fatal(message: impl std::fmt::Display) -> ExitCode {
     log::error!("{message}");
-    std::process::exit(1);
+    ExitCode::FAILURE
 }
 
 /// Installs the `log` backend `target` selects, filtered to `level`. Called
@@ -356,8 +360,7 @@ fn init_logging(target: LogTarget, syslog_ident: Option<&str>, level: log::Level
 }
 
 /// Resolves once SIGINT or SIGTERM is received.
-async fn shutdown_requested() {
-    let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+async fn shutdown_requested(terminate: &mut Signal) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
@@ -422,7 +425,7 @@ async fn reload_config(path: &Path, config: &ArcSwap<Config>, limiter: &ArcSwap<
 /// killed.
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     // Refuses to run at all unless explicitly acknowledged - see
     // INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR. Before logging is set up, so
     // this can only reach the user via stderr directly.
@@ -433,7 +436,7 @@ async fn main() {
              {} to acknowledge this is a test build",
             postfix_ratelimitd::INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR
         );
-        std::process::exit(1);
+        return ExitCode::FAILURE;
     }
 
     let cli = Cli::parse();
@@ -441,20 +444,20 @@ async fn main() {
 
     let config = match Config::load(&cli.config) {
         Ok(config) => config,
-        Err(err) => fatal(format!("failed to load config {}: {err}", cli.config.display())),
+        Err(err) => return fatal(format!("failed to load config {}: {err}", cli.config.display())),
     };
 
     if cli.check_config {
         if let Err(err) = check_socket_directory(&config.socket) {
-            fatal(format!("socket directory check failed for {}: {err}", config.socket.display()));
+            return fatal(format!("socket directory check failed for {}: {err}", config.socket.display()));
         }
         println!("config OK: {}", cli.config.display());
-        return;
+        return ExitCode::SUCCESS;
     }
 
     let limiter = match Limiter::new(config.redis_connection_info.clone(), config.redis_key_prefix.clone()).await {
         Ok(limiter) => limiter,
-        Err(err) => fatal(format!("failed to initialize valkey client: {err}")),
+        Err(err) => return fatal(format!("failed to initialize valkey client: {err}")),
     };
 
     // Narrows, but doesn't close, the window for two instances starting at
@@ -462,7 +465,7 @@ async fn main() {
     // that fully would need a lock file, which this daemon doesn't otherwise
     // need and isn't worth adding just to cover that unlikely a race.
     if socket_is_live(&config.socket) {
-        fatal(format!(
+        return fatal(format!(
             "refusing to start: {} is either already listening, or its permissions couldn't be verified",
             config.socket.display()
         ));
@@ -471,7 +474,7 @@ async fn main() {
     if let Err(err) = std::fs::remove_file(&config.socket)
         && err.kind() != std::io::ErrorKind::NotFound
     {
-        fatal(format!("failed to remove stale socket {}: {err}", config.socket.display()));
+        return fatal(format!("failed to remove stale socket {}: {err}", config.socket.display()));
     }
 
     // A freshly bound socket briefly exists at bind()'s own default mode until
@@ -488,13 +491,13 @@ async fn main() {
     unsafe { libc::umask(previous_umask) };
     let listener = match listener {
         Ok(listener) => listener,
-        Err(err) => fatal(format!("failed to bind socket {}: {err}", config.socket.display())),
+        Err(err) => return fatal(format!("failed to bind socket {}: {err}", config.socket.display())),
     };
     // Access control is the install-time socket directory's job, not this file's -
     // SOCKET_MODE only needs to be as tight as sharing the socket with Postfix's
     // group requires, not to substitute for the directory's own restriction.
     if let Err(err) = std::fs::set_permissions(&config.socket, std::fs::Permissions::from_mode(SOCKET_MODE)) {
-        fatal(format!("failed to set permissions on socket {}: {err}", config.socket.display()));
+        return fatal(format!("failed to set permissions on socket {}: {err}", config.socket.display()));
     }
 
     log::info!("listening on {}", config.socket.display());
@@ -512,9 +515,16 @@ async fn main() {
     let limiter = Arc::new(ArcSwap::from_pointee(limiter));
     let reload_in_progress = Arc::new(AtomicBool::new(false));
     let reload_requests = Arc::new(AtomicU64::new(0));
-    let shutdown = shutdown_requested();
+    let mut terminate_signal = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(err) => return fatal(format!("failed to install SIGTERM handler: {err}")),
+    };
+    let mut reload_signal = match signal(SignalKind::hangup()) {
+        Ok(signal) => signal,
+        Err(err) => return fatal(format!("failed to install SIGHUP handler: {err}")),
+    };
+    let shutdown = shutdown_requested(&mut terminate_signal);
     tokio::pin!(shutdown);
-    let mut reload_signal = signal(SignalKind::hangup()).expect("install SIGHUP handler");
     let cancel = CancellationToken::new();
     let tracker = TaskTracker::new();
 
@@ -591,6 +601,7 @@ async fn main() {
     if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, tracker.wait()).await.is_err() {
         log::warn!("timed out waiting for in-flight connections to close during shutdown");
     }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
