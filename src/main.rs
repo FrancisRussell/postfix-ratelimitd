@@ -1,4 +1,5 @@
 #![warn(clippy::pedantic)]
+#![deny(unsafe_code)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -441,6 +442,16 @@ async fn reload_config(path: &Path, config: &ArcSwap<Config>, limiter: &ArcSwap<
     log::info!("reloaded config from {}", path.display());
 }
 
+/// Sets the process umask, returning the previous one - the only unsafe
+/// code in this crate, confined here so `#![deny(unsafe_code)]` above
+/// catches anything else added outside it.
+///
+/// SAFETY: `umask(2)` only reads and writes process-wide umask state - it
+/// can't invalidate anything else, regardless of what else is running
+/// concurrently.
+#[allow(unsafe_code)]
+fn set_umask(mask: u32) -> u32 { unsafe { libc::umask(mask) } }
+
 /// Loads the config, binds the policy socket, and serves connections until
 /// killed.
 #[allow(clippy::too_many_lines)]
@@ -521,9 +532,9 @@ async fn main() -> ExitCode {
     // unsound to leave narrowed around anything that creates files without an
     // explicit mode of its own on another task - nothing between the two
     // umask calls here does that, only the bind() itself.
-    let previous_umask = unsafe { libc::umask(SOCKET_CREATE_UMASK) };
+    let previous_umask = set_umask(SOCKET_CREATE_UMASK);
     let listener = UnixListener::bind(&config.socket);
-    unsafe { libc::umask(previous_umask) };
+    set_umask(previous_umask);
     let listener = match listener {
         Ok(listener) => listener,
         Err(err) => return fatal(format!("failed to bind socket {}: {err}", config.socket.display())),

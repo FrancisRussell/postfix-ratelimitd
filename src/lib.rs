@@ -5,6 +5,7 @@
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::missing_errors_doc)]
+#![forbid(unsafe_code)]
 
 pub mod config;
 pub mod limiter;
