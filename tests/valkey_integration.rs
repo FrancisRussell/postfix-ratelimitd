@@ -418,6 +418,50 @@ fn a_second_instance_refuses_to_start_while_the_first_is_still_listening() {
 }
 
 #[test]
+fn unreachable_redis_at_startup_is_fatal() {
+    // `on_redis_error` only governs a check-time failure against an already
+    // established connection - it says nothing about startup, which should
+    // fail outright rather than come up in some permanently-degraded state.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let dead_socket = dir.path().join("nothing-here.sock");
+    let policy_socket = dir.path().join("policy.sock");
+    let mut config = default_sasl_config(1, "60s");
+    set_default(&mut config, "redis", "url", format!("redis+unix://{}", dead_socket.display()));
+    set_default(&mut config, "redis", "db", 0i64);
+    set_default(&mut config, "server", "socket", policy_socket.display().to_string());
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_postfix-ratelimitd"))
+        .arg("--config")
+        .arg(&config_path)
+        .env(INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR, "1")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+
+    // Generous relative to READY_TIMEOUT: failing to connect goes through the
+    // same retry/backoff as a real transient outage before giving up.
+    let deadline = Instant::now() + READY_TIMEOUT * 3;
+    let status = loop {
+        if let Some(status) = daemon.try_wait().expect("poll daemon") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "daemon should have given up connecting and exited by now");
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    assert!(!status.success(), "startup should fail outright rather than come up in a degraded state");
+    assert!(!policy_socket.exists(), "the policy socket should never be created if startup fails before binding it");
+
+    // Checks that something was actually logged, not the specific wording -
+    // any correctly-implemented fatal-startup path logs at error level before
+    // exiting.
+    let mut stderr = String::new();
+    daemon.stderr.take().expect("captured stderr").read_to_string(&mut stderr).expect("read stderr");
+    assert!(stderr.contains("ERROR"), "expected an error to be logged before exit, got: {stderr}");
+}
+
+#[test]
 fn successful_check_writes_a_real_key() {
     let valkey = ValkeyInstance::start_unix();
     let daemon = Daemon::start(&valkey, default_sasl_config(50, "1h"));
