@@ -287,8 +287,8 @@ pub enum ConfigError {
     Read { path: PathBuf, source: std::io::Error },
     #[error("failed to parse config file {path}: {source}")]
     Parse { path: PathBuf, source: Box<toml::de::Error> },
-    #[error("invalid redis_url: {source}")]
-    BadRedisUrl { source: redis::RedisError },
+    #[error("invalid redis_url {url:?}: {source}")]
+    BadRedisUrl { url: String, source: redis::RedisError },
     #[error("redis_url already has a password and redis_password_file is also set; supply the password only one way")]
     AmbiguousPassword,
     #[error("failed to read redis_password_file {path}: {source}")]
@@ -379,8 +379,12 @@ impl Config {
         let raw: RawConfig = toml::from_str(&text)
             .map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source: Box::new(source) })?;
 
-        let mut redis_connection_info =
-            raw.redis.url.as_str().into_connection_info().map_err(|source| ConfigError::BadRedisUrl { source })?;
+        let mut redis_connection_info = raw
+            .redis
+            .url
+            .as_str()
+            .into_connection_info()
+            .map_err(|source| ConfigError::BadRedisUrl { url: raw.redis.url.clone(), source })?;
         let mut redis_settings = redis_connection_info.redis_settings().clone().set_db(raw.redis.db);
         if let Some(path) = raw.redis.password_file {
             if redis_settings.password().is_some() {
