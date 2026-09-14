@@ -842,4 +842,40 @@ mod tests {
         assert_eq!(config.plan_for("bob@contractors.example.com").windows[0].limit, 10);
         assert_eq!(config.plan_for("nobody").windows[0].limit, 50);
     }
+
+    #[test]
+    fn rule_precedence_is_purely_positional_not_type_based() {
+        // A username matching both a regex rule and a later, more specific username
+        // rule: precedence goes to whichever is declared first, regardless of type -
+        // there's no implicit "specific beats general" or "username beats regex"
+        // ordering, only "first match wins" (see plan_for).
+        let toml = toml::toml! {
+            [redis]
+            url = "redis://127.0.0.1:6379"
+            db = 1
+
+            [server]
+            socket = "/tmp/policy"
+
+            [[sasl]]
+            type = "regex"
+            regex = r"^alice@"
+            windows = [ { count = 10, duration = "1h" } ]
+
+            [[sasl]]
+            type = "username"
+            username = "alice@example.com"
+            windows = [ { count = 20, duration = "1h" } ]
+
+            [[sasl]]
+            type = "default"
+            windows = [ { count = 50, duration = "1h" } ]
+        };
+        let config = load(toml).expect("valid config");
+        assert_eq!(
+            config.plan_for("alice@example.com").windows[0].limit,
+            10,
+            "the earlier regex rule should win over the later, more specific username rule"
+        );
+    }
 }
