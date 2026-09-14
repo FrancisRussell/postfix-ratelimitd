@@ -76,6 +76,10 @@ const EXPECTED_PROTOCOL_STATES: [&str; 2] = ["DATA", "END-OF-MESSAGE"];
 const SOCKET_MODE: u32 = 0o660;
 const SOCKET_PROBE_PREFIX: &str = ".rl-check-";
 
+/// Suffix naming this instance's startup lock file (see
+/// `acquire_startup_lock`), in the same directory as `server.socket`.
+const LOCK_FILE_SUFFIX: &str = ".lock";
+
 /// Forces a freshly created socket's default mode to owner-only, regardless
 /// of the ambient umask, by clearing every group/other bit a `bind()` call
 /// could otherwise leave set - see its use around the socket bind for why.
@@ -300,6 +304,22 @@ fn check_socket_directory(socket: &Path) -> std::io::Result<()> {
     std::fs::remove_file(&probe)
 }
 
+/// Acquires an exclusive, non-blocking lock on `socket`'s lock file - unlike
+/// `socket_is_live`'s check-then-act, this is atomic, closing (not just
+/// narrowing) the race between two instances of this daemon starting at
+/// once. Never explicitly released: a later instance can just reopen and
+/// relock the same path once this process's handle on it closes - unless
+/// something else unlinks it first, since the lock is tied to the open
+/// file, not the path, and a new instance would then relock a fresh inode
+/// without ever conflicting with this one.
+fn acquire_startup_lock(socket: &Path) -> std::io::Result<std::fs::File> {
+    let mut lock_path = socket.as_os_str().to_owned();
+    lock_path.push(LOCK_FILE_SUFFIX);
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path)?;
+    file.try_lock()?;
+    Ok(file)
+}
+
 /// Whether another process is already listening on `socket`, or this process
 /// can't tell either way. Connecting succeeds as soon as a listener exists
 /// (it doesn't need to `accept()` this specific connection first), so a
@@ -455,18 +475,33 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Declared before the listener and everything else server-related below,
+    // so it outlives all of them - held through this instance's full
+    // shutdown drain, not just this startup sequence. Acquired before
+    // connecting to Redis so a redundant instance fails immediately, rather
+    // than after paying for a connection attempt it was always going to
+    // throw away.
+    let _startup_lock = match acquire_startup_lock(&config.socket) {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            return fatal(format!(
+                "refusing to start: the startup lock for {} is already held",
+                config.socket.display()
+            ));
+        }
+        Err(err) => {
+            return fatal(format!("failed to acquire startup lock for {}: {err}", config.socket.display()));
+        }
+    };
+
     let limiter = match Limiter::new(config.redis_connection_info.clone(), config.redis_key_prefix.clone()).await {
         Ok(limiter) => limiter,
         Err(err) => return fatal(format!("failed to initialize valkey client: {err}")),
     };
 
-    // Narrows, but doesn't close, the window for two instances starting at
-    // the same time to both see no listener here and both proceed - closing
-    // that fully would need a lock file, which this daemon doesn't otherwise
-    // need and isn't worth adding just to cover that unlikely a race.
     if socket_is_live(&config.socket) {
         return fatal(format!(
-            "refusing to start: {} is either already listening, or its permissions couldn't be verified",
+            "refusing to start: {} is already in use by another process, or its permissions couldn't be verified",
             config.socket.display()
         ));
     }

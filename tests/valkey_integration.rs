@@ -409,7 +409,7 @@ fn a_second_instance_refuses_to_start_while_the_first_is_still_listening() {
 
     let mut stderr = String::new();
     second.stderr.take().expect("captured stderr").read_to_string(&mut stderr).expect("read stderr");
-    assert!(stderr.contains("already listening"), "expected a clear refusal message, got: {stderr}");
+    assert!(stderr.contains("refusing to start"), "expected a clear refusal message, got: {stderr}");
 
     // The first instance's own socket must be completely unaffected by the
     // second instance's failed startup attempt.
