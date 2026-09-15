@@ -233,6 +233,8 @@ pub enum ConfigError {
     ReadPasswordFile { path: PathBuf, source: std::io::Error },
     #[error("invalid regex in sasl[{index}]: {source}")]
     BadRegex { index: usize, source: regex_lite::Error },
+    #[error("sasl[{index}] has an empty `username`, which is invalid")]
+    EmptyUsername { index: usize },
     #[error("sasl must contain exactly one `type = \"default\"` rule, found {count}")]
     DefaultCount { count: usize },
     #[error(
@@ -333,6 +335,9 @@ impl Config {
         for (index, rule) in raw.sasl_limits.into_iter().enumerate() {
             match rule {
                 RawSaslLimitRule::Username { username, windows, unrestricted } => {
+                    if username.is_empty() {
+                        return Err(ConfigError::EmptyUsername { index });
+                    }
                     let plan = build_plan(index, windows, unrestricted)?;
                     sasl_limits.push(SaslLimitRule { matcher: SaslMatcher::Username(username), plan });
                 }
