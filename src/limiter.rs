@@ -55,31 +55,39 @@ const BUCKET_KEY_TYPE: &str = "bucket";
 /// this, since it already can't collide with the shape it replaces.
 const BUCKET_SCHEMA_VERSION: &str = "v1";
 
-/// Escapes `\` and `:` in `sasl_username` so it can't be mistaken for
-/// anything else once joined into a bucket key - see `bucket_key`. Borrows
-/// the input unchanged when nothing needs escaping, which is the common case
-/// for real usernames, rather than always allocating a new `String`.
-fn escape_username(sasl_username: &str) -> Cow<'_, str> {
-    if sasl_username.contains(['\\', ':']) {
-        Cow::Owned(sasl_username.replace('\\', "\\\\").replace(':', "\\:"))
+/// The identity kind tagging every `sasl_username` bucketed by
+/// `Limiter::check` - see `identity`.
+const SASL_IDENTITY_KIND: &str = "sasl";
+
+/// Escapes `\` and `:` in `value` so it can't be mistaken for anything else
+/// once embedded in an `identity` string. Borrows the input unchanged when
+/// nothing needs escaping, which is the common case, rather than always
+/// allocating a new `String`.
+fn escape_identity_value(value: &str) -> Cow<'_, str> {
+    if value.contains(['\\', ':']) {
+        Cow::Owned(value.replace('\\', "\\\\").replace(':', "\\:"))
     } else {
-        Cow::Borrowed(sasl_username)
+        Cow::Borrowed(value)
     }
 }
 
-/// The Redis key for one `sasl_username`'s bucket at `bucket_size` - the only
-/// place a bucket key gets built, so escaping `sasl_username` here is enough
-/// to guarantee it everywhere.
-///
-/// `bucket_size` is always plain decimal digits, so escaping `\` and `:` in
-/// `sasl_username` (backslash-escaping the escape character itself, then the
-/// separator) guarantees two different `(sasl_username, bucket_size)` pairs
-/// never produce the same key: the last unescaped `:` unambiguously marks
-/// where `bucket_size` starts. Without this, `sasl_username` "alice:64"
-/// would collide with username "alice" at `bucket_size` 64.
-fn bucket_key(key_prefix: &str, sasl_username: &str, bucket_size: u64) -> String {
-    let escaped = escape_username(sasl_username);
-    format!("{key_prefix}:{BUCKET_KEY_TYPE}:{BUCKET_SCHEMA_VERSION}:{escaped}:{bucket_size}")
+/// Formats `value` as a `bucket_key` identity, tagged with `kind` so a
+/// different kind sharing the same literal `value` can't collide onto the
+/// same key. `kind` must never itself contain `\` or `:` - true of every
+/// kind used in this crate. Escaping `value` means the result never
+/// contains a bare `:`, so `bucket_key` can safely append more after it.
+fn identity(kind: &str, value: &str) -> String {
+    debug_assert!(!kind.contains(['\\', ':']), "identity kind {kind:?} must not contain '\\' or ':'");
+    format!("{kind}:{}", escape_identity_value(value))
+}
+
+/// The Redis key for one `bucket_size` slice of `identity`'s recorded
+/// counts. This is the only place a bucket key is assembled; `identity`
+/// (see `identity`) is already unambiguous, so appending `bucket_size`
+/// (always plain decimal digits) after it can't collide with a different
+/// `(identity, bucket_size)` pair.
+fn bucket_key(key_prefix: &str, identity: &str, bucket_size: u64) -> String {
+    format!("{key_prefix}:{BUCKET_KEY_TYPE}:{BUCKET_SCHEMA_VERSION}:{identity}:{bucket_size}")
 }
 
 /// Commands `check_and_record.lua` and `Script::invoke_async` depend on:
@@ -158,8 +166,9 @@ impl Limiter {
         let mut connection = self.connection_manager.clone();
         let mut invocation = self.script.prepare_invoke();
 
+        let sasl_identity = identity(SASL_IDENTITY_KIND, sasl_username);
         for &bucket_size in &plan.bucket_sizes {
-            invocation.key(bucket_key(&self.key_prefix, sasl_username, bucket_size));
+            invocation.key(bucket_key(&self.key_prefix, &sasl_identity, bucket_size));
         }
 
         let request = CheckRequest { recipient_count, now_override, plan };
@@ -177,30 +186,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn escape_username_borrows_when_nothing_needs_escaping() {
-        assert!(matches!(escape_username("alice"), Cow::Borrowed(_)));
+    fn escape_identity_value_borrows_when_nothing_needs_escaping() {
+        assert!(matches!(escape_identity_value("alice"), Cow::Borrowed(_)));
     }
 
     #[test]
-    fn escape_username_allocates_only_when_escaping_is_needed() {
-        assert!(matches!(escape_username("alice:64"), Cow::Owned(_)));
-        assert!(matches!(escape_username("alice\\"), Cow::Owned(_)));
+    fn escape_identity_value_allocates_only_when_escaping_is_needed() {
+        assert!(matches!(escape_identity_value("alice:64"), Cow::Owned(_)));
+        assert!(matches!(escape_identity_value("alice\\"), Cow::Owned(_)));
     }
 
     #[test]
-    fn bucket_key_does_not_collide_across_the_username_bucket_size_boundary() {
-        // Without escaping, both would produce "prefix:bucket:v1:alice:64".
-        let a = bucket_key("prefix", "alice:64", 1);
-        let b = bucket_key("prefix", "alice", 64);
+    fn identity_distinguishes_kinds_sharing_the_same_value() {
+        assert_ne!(identity("sasl", "alice"), identity("mail-from", "alice"));
+    }
+
+    #[test]
+    fn bucket_key_does_not_collide_across_the_identity_bucket_size_boundary() {
+        // Without escaping, both would produce "prefix:bucket:v1:sasl:alice:64".
+        let a = bucket_key("prefix", &identity(SASL_IDENTITY_KIND, "alice:64"), 1);
+        let b = bucket_key("prefix", &identity(SASL_IDENTITY_KIND, "alice"), 64);
         assert_ne!(a, b);
     }
 
     #[test]
     fn bucket_key_does_not_collide_when_a_username_ends_in_a_backslash() {
         // Without escaping the escape character itself, both would produce
-        // "prefix:bucket:v1:alice\:64".
-        let a = bucket_key("prefix", "alice\\", 64);
-        let b = bucket_key("prefix", "alice", 64);
+        // "prefix:bucket:v1:sasl:alice\:64".
+        let a = bucket_key("prefix", &identity(SASL_IDENTITY_KIND, "alice\\"), 64);
+        let b = bucket_key("prefix", &identity(SASL_IDENTITY_KIND, "alice"), 64);
         assert_ne!(a, b);
     }
 }

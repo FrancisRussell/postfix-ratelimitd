@@ -469,7 +469,7 @@ fn successful_check_writes_a_real_key() {
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
-    let keys = valkey.keys("rl:bucket:v1:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:sasl:alice:*");
     assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
     let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
@@ -501,7 +501,7 @@ fn unrestricted_rule_permits_any_volume_and_records_nothing() {
         assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
     }
     assert!(
-        valkey.keys("rl:bucket:v1:trusted-service:*").is_empty(),
+        valkey.keys("rl:bucket:v1:sasl:trusted-service:*").is_empty(),
         "an unrestricted rule has no window to record anything in"
     );
 
@@ -524,7 +524,7 @@ fn wrong_protocol_state_defers_without_checking() {
     // Never reached the rate-limit check at all, so nothing should be recorded -
     // under any key, not just the one this window's own bucket size would use.
     assert!(
-        valkey.keys("rl:bucket:v1:alice:*").is_empty(),
+        valkey.keys("rl:bucket:v1:sasl:alice:*").is_empty(),
         "a misconfigured-protocol-state request must not be recorded"
     );
 }
@@ -553,7 +553,7 @@ fn missing_recipient_count_defers_without_checking() {
     let response = daemon.raw_request("sasl_username=alice\nprotocol_state=DATA\n\n");
     assert_eq!(response, format!("action={ACTION_MISCONFIGURED}\n\n"));
 
-    assert!(valkey.keys("rl:bucket:v1:alice:*").is_empty(), "a misconfigured request must not be recorded");
+    assert!(valkey.keys("rl:bucket:v1:sasl:alice:*").is_empty(), "a misconfigured request must not be recorded");
 }
 
 #[test]
@@ -637,7 +637,7 @@ fn successful_check_over_tcp() {
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
-    let keys = valkey.keys("rl:bucket:v1:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:sasl:alice:*");
     assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
     let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
@@ -658,7 +658,7 @@ fn rate_limit_exceeded_defers_and_does_not_record() {
     assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"));
 
     // The rejected message must not have been recorded alongside the accepted one.
-    let keys = valkey.keys("rl:bucket:v1:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:sasl:alice:*");
     assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
     let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
@@ -675,7 +675,7 @@ fn exceeding_either_window_defers_and_accepted_records_in_both() {
     // rejected.
     let response = daemon.request("alice", 3);
     assert_eq!(response, format!("action={ACTION_RATE_LIMITED}\n\n"));
-    assert!(valkey.keys("rl:bucket:v1:alice:*").is_empty(), "rejected message must not be recorded in any window");
+    assert!(valkey.keys("rl:bucket:v1:sasl:alice:*").is_empty(), "rejected message must not be recorded in any window");
 
     // Fits both windows: accepted and recorded in both. The 1h and 1d windows
     // land on different bucket sizes, so each gets its own key - discovered
@@ -684,7 +684,7 @@ fn exceeding_either_window_defers_and_accepted_records_in_both() {
     let response = daemon.request("alice", 2);
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
-    let keys = valkey.keys("rl:bucket:v1:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:sasl:alice:*");
     assert_eq!(keys.len(), 2, "the hourly and daily windows should each get their own key");
     let mut connection = valkey.connection();
     for key in &keys {
@@ -705,7 +705,7 @@ fn expired_entries_stop_counting_against_the_limit() {
     // checking) a key the daemon never touches.
     let probe_response = daemon.request("probe", 1);
     assert_eq!(probe_response, format!("action={ACTION_DUNNO}\n\n"), "probe message should be accepted");
-    let probe_keys = valkey.keys("rl:bucket:v1:probe:*");
+    let probe_keys = valkey.keys("rl:bucket:v1:sasl:probe:*");
     assert_eq!(probe_keys.len(), 1, "expected exactly one key for the probe window");
     let bucket_size: u64 = probe_keys[0]
         .rsplit(':')
@@ -713,7 +713,7 @@ fn expired_entries_stop_counting_against_the_limit() {
         .expect("key has a bucket-size suffix")
         .parse()
         .expect("bucket size is numeric");
-    let key = format!("rl:bucket:v1:alice:{bucket_size}");
+    let key = format!("rl:bucket:v1:sasl:alice:{bucket_size}");
 
     // Seed a bucket far outside the window's lookback, as if a message had
     // been recorded and then aged out - real time never needs to pass for
@@ -848,7 +848,7 @@ fn a_shorter_window_stops_counting_before_its_shared_key_is_pruned() {
     // rests on - discovered rather than assumed, so a change to the bucket-size
     // computation makes this fail loudly instead of silently checking a key
     // the daemon never touches.
-    let keys = valkey.keys("rl:bucket:v1:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:sasl:alice:*");
     assert_eq!(keys.len(), 1, "the 19d and 31d windows should share one key");
 
     // The 25-day-old entry must still be physically present, though - it's
@@ -951,7 +951,7 @@ fn tls_connection_to_valkey_with_custom_ca() {
     assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
 
     // Confirms the check actually went through the TLS-only server, not a fallback.
-    let keys = valkey.keys("rl:bucket:v1:alice:*");
+    let keys = valkey.keys("rl:bucket:v1:sasl:alice:*");
     assert_eq!(keys.len(), 1, "expected exactly one key for the one configured window");
     let mut connection = valkey.connection();
     let fields: Vec<(String, String)> = redis::cmd("HGETALL").arg(&keys[0]).query(&mut connection).expect("hgetall");
@@ -1072,7 +1072,7 @@ fn concurrent_requests_spread_across_many_usernames_are_all_recorded() {
 
     for user in 0..SPREAD_USER_COUNT {
         let username = format!("spread-user-{user}");
-        let keys = valkey.keys(&format!("rl:bucket:v1:{username}:*"));
+        let keys = valkey.keys(&format!("rl:bucket:v1:sasl:{username}:*"));
         assert_eq!(keys.len(), 1, "expected exactly one key for {username}'s one configured window");
         let mut connection = valkey.connection();
         let fields: Vec<(String, String)> =
@@ -1242,7 +1242,7 @@ fn sequential_requests_stay_fast_across_many_concurrent_connections_with_full_wi
     // assuming the value config::bucket_size(3600s) currently computes.
     let probe_response = daemon.request("bucket-size-probe", 1);
     assert_eq!(probe_response, format!("action={ACTION_DUNNO}\n\n"), "probe message should be accepted");
-    let probe_keys = valkey.keys("rl:bucket:v1:bucket-size-probe:*");
+    let probe_keys = valkey.keys("rl:bucket:v1:sasl:bucket-size-probe:*");
     assert_eq!(probe_keys.len(), 1, "expected exactly one key for the probe window");
     let bucket_size: u64 = probe_keys[0]
         .rsplit(':')
