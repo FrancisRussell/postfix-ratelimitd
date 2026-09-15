@@ -14,12 +14,7 @@ pub struct Window {
 }
 
 /// A `sasl` entry as written in the config file, before its regex is
-/// compiled. `windows` and `unrestricted` are both optional and independent
-/// at this level - omitting either leaves it `None`, distinct from writing
-/// it out as empty or `false`. `build_plan` treats every combination other
-/// than "windows only" or "unrestricted = true only" as an error - see its
-/// own doc comment for why `unrestricted = false` is rejected rather than
-/// accepted as a no-op.
+/// compiled.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 enum RawSaslLimitRule {
@@ -72,50 +67,29 @@ impl SaslLimitRule {
 /// The default value of `redis_key_prefix` when the config file omits it.
 fn default_key_prefix() -> String { "postfix-ratelimitd".to_string() }
 
-/// The default value of `redis.db` when the config file omits it - Redis and
-/// Valkey both default a connection to database 0 when none is selected.
+/// The default value of `redis.db` when the config file omits it. Redis and
+/// Valkey both default a connection to database 0.
 fn default_db() -> i64 { 0 }
 
-/// The shortest window duration accepted. Chosen for sanity as an anti-abuse
-/// email rate limit (sub-minute windows suit burst API protection more than
-/// SMTP abuse, which is caught by hourly/daily thresholds instead), and
-/// comfortably above the point where `BUCKET_TARGET_COUNT` needs no help from
-/// clamping to `MIN_BUCKET_SIZE`.
+/// The shortest window duration accepted.
 const MIN_WINDOW_DURATION: Duration = Duration::from_mins(1);
 
-/// The longest window duration accepted - the longest possible calendar
-/// month.
+/// The longest window duration accepted.
 const MAX_WINDOW_DURATION: Duration = Duration::from_hours(31 * 24);
 
 /// Windows are aggregated into time buckets rather than storing one entry per
-/// message (see `check_and_record.lua`). This is the number of buckets a
-/// window is aggregated into, for any window whose resulting bucket size
-/// doesn't need clamping to `MIN_BUCKET_SIZE` or `MAX_BUCKET_SIZE` - giving a
-/// target overcount of `1/BUCKET_TARGET_COUNT` (2%) of the window's own
-/// duration.
+/// message. Any window will be evaluated using at least this number
+/// of buckets, bounding the overcount duration.
 pub const BUCKET_TARGET_COUNT: u64 = 50;
 
-/// The smallest bucket size ever used, regardless of what
-/// `BUCKET_TARGET_COUNT` would otherwise compute for a very short window.
+/// The smallest bucket duration ever used.
 const MIN_BUCKET_SIZE: Duration = Duration::from_secs(1);
 
-/// The largest bucket size ever used, regardless of what
-/// `BUCKET_TARGET_COUNT` would otherwise compute for a very long window - a
-/// day. Doesn't need to itself be a power of two: `bucket_size` only ever
-/// compares a candidate doubling (always a power of two) against this value,
-/// so whatever clears that comparison is already the largest power of two not
-/// exceeding it, with no separate rounding step needed. Chosen independently
-/// of `BUCKET_TARGET_COUNT` and `MAX_WINDOW_DURATION` rather than derived
-/// from them, so it doesn't need retuning whenever either of those does; a
-/// window needs to be at least `BUCKET_TARGET_COUNT * MAX_BUCKET_SIZE` long
-/// to ever reach this clamp, which at the current `BUCKET_TARGET_COUNT` is
-/// longer than `MAX_WINDOW_DURATION` allows - this is currently unreachable,
-/// not dead: raising either constant later can make it live again without
-/// any change here.
+/// The largest bucket duration ever used.
 const MAX_BUCKET_SIZE: Duration = Duration::from_hours(24);
 
-/// Selects the Redis hash bucket size to aggregate a window's messages into:
-/// the largest power-of-two multiple of `MIN_BUCKET_SIZE`, up to
+/// Selects the Redis hash bucket size to aggregate a window's messages into.
+/// This is the largest power-of-two multiple of `MIN_BUCKET_SIZE`, up to
 /// `MAX_BUCKET_SIZE`, for which `duration` still spans at least
 /// `BUCKET_TARGET_COUNT` of them.
 pub(crate) fn bucket_size(duration: Duration) -> Duration {
@@ -127,62 +101,38 @@ pub(crate) fn bucket_size(duration: Duration) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// One window's position within a [`CheckPlan`]: which of its
-/// `bucket_sizes` entries it shares, its span in seconds (the window's
-/// configured duration), and its recipient limit. Sent to
-/// `check_and_record.lua` as JSON, so field names are part of that script's
-/// contract - see its ARGV comment.
+/// A single window within a [`CheckPlan`].
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct PlannedWindow {
+    /// 0-based index into the parent [`CheckPlan`]'s arrays, not necessarily unique to this
+    /// window.
     pub key_index: usize,
+    /// This window's configured duration, in seconds.
     pub span_secs: u64,
+    /// The recipient count this window rejects at.
     pub limit: u32,
 }
 
-/// The `bucket_sizes`/`retention_secs`/`windows` fields of a [`CheckPlan`],
-/// factored out so `Limiter::check` can nest them into a request without
-/// duplicating the fields making it up.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct CheckPlanFields<'a> {
-    pub(crate) bucket_sizes: &'a [u64],
-    pub(crate) retention_secs: &'a [u64],
-    pub(crate) windows: &'a [PlannedWindow],
-}
-
 /// The precomputed shape of a `check_and_record.lua` invocation for a set of
-/// windows - built once when the config is loaded rather than on every
-/// check, since bucket sizes and spans depend only on window durations, never
-/// on a request. `bucket_sizes` is deduplicated: windows whose durations land
-/// on the same bucket size share one entry, and `PlannedWindow::key_index`
-/// points into it.
-#[derive(Debug, Clone)]
+/// windows.
+#[derive(Debug, Clone, Serialize)]
 pub struct CheckPlan {
+    /// Sizes of buckets in seconds.
     pub bucket_sizes: Vec<u64>,
+    /// Each window active for this rule.
     pub windows: Vec<PlannedWindow>,
     // The longest span (in seconds) any window sharing bucket_sizes[i] needs
-    // retained - the widest of their spans, since a key must keep history for
-    // whichever sharing window needs the most. check_and_record.lua uses this
-    // directly for that key's EXPIRE and prune cutoff, rather than
-    // re-deriving it from `windows` on every check.
+    // retained.
     pub retention_secs: Vec<u64>,
 }
 
 impl CheckPlan {
-    /// Builds a plan from a rule's windows - see the `CheckPlan` docs above.
-    ///
-    /// Two windows are checked against the exact same accumulated total
-    /// exactly when their `span_secs` match - `span_secs` is just the
-    /// window's own configured duration, and bucket size is a pure function
-    /// of duration, so matching `span_secs` already guarantees matching
-    /// `key_index` too; the reverse doesn't hold, since windows sharing a
-    /// bucket size can still need different retentions. Either way, only
-    /// the stricter (lower) of the matching limits can ever be the one that
-    /// rejects, so the other is folded in rather than kept as a redundant
-    /// entry.
+    /// Builds a plan from a rule's windows.
     fn new(windows: &[Window]) -> CheckPlan {
         let mut bucket_sizes: Vec<u64> = Vec::new();
         let mut retention_secs: Vec<u64> = Vec::new();
         let mut planned_windows: Vec<PlannedWindow> = Vec::new();
+        // For each window, compute the bucket size and the retention time
         for window in windows {
             let size = bucket_size(window.duration).as_secs();
             let key_index = bucket_sizes.iter().position(|&existing| existing == size).unwrap_or_else(|| {
@@ -193,22 +143,13 @@ impl CheckPlan {
             let span_secs = window.duration.as_secs();
             retention_secs[key_index] = retention_secs[key_index].max(span_secs);
 
+            // For two windows of identical durations, take the smaller count
             match planned_windows.iter_mut().find(|w| w.key_index == key_index && w.span_secs == span_secs) {
                 Some(existing) => existing.limit = existing.limit.min(window.count),
                 None => planned_windows.push(PlannedWindow { key_index, span_secs, limit: window.count }),
             }
         }
         CheckPlan { bucket_sizes, windows: planned_windows, retention_secs }
-    }
-
-    /// Borrows this plan's fields for nesting into a `Limiter::check` request
-    /// - cheap, since it's just references, not a serialization.
-    pub(crate) fn fields(&self) -> CheckPlanFields<'_> {
-        CheckPlanFields {
-            bucket_sizes: &self.bucket_sizes,
-            retention_secs: &self.retention_secs,
-            windows: &self.windows,
-        }
     }
 }
 
@@ -249,10 +190,7 @@ struct RawServerConfig {
     socket: PathBuf,
     #[serde(default = "default_redis_error_action")]
     on_redis_error: FailureAction,
-    // Unauthenticated requests are always permitted (there's no SASL username to
-    // rate-limit against) - this only controls whether that's logged, for a
-    // deployment that intentionally shares a restriction class between
-    // authenticated and unauthenticated traffic and doesn't want the warning.
+    /// Whether requests with no SASL username have warnings logged.
     #[serde(default = "default_warn_on_unauthenticated")]
     warn_on_unauthenticated: bool,
 }
@@ -324,37 +262,25 @@ pub enum ConfigError {
 /// Rejects an empty `windows` list, or any window whose duration isn't a
 /// whole number of seconds or falls outside `[MIN_WINDOW_DURATION,
 /// MAX_WINDOW_DURATION]`.
-fn validate_windows(index: usize, windows: &[Window]) -> Result<(), ConfigError> {
+fn validate_windows(rule_index: usize, windows: &[Window]) -> Result<(), ConfigError> {
     if windows.is_empty() {
-        return Err(ConfigError::NoWindows { index });
+        return Err(ConfigError::NoWindows { index: rule_index });
     }
-    // Does this correctly validate the window is a whole numebr of seconds.
     for window in windows {
         if window.duration.subsec_nanos() != 0 || window.duration < MIN_WINDOW_DURATION {
-            return Err(ConfigError::WindowTooShort { index, duration: window.duration });
+            return Err(ConfigError::WindowTooShort { index: rule_index, duration: window.duration });
         }
         if window.duration > MAX_WINDOW_DURATION {
-            return Err(ConfigError::WindowTooLong { index, duration: window.duration });
+            return Err(ConfigError::WindowTooLong { index: rule_index, duration: window.duration });
         }
     }
     Ok(())
 }
 
-/// Builds the `CheckPlan` for one rule's `windows`/`unrestricted` pair - an
-/// empty plan that never records anything and always permits, when
-/// `unrestricted` is explicitly `true`, or a validated plan built from
-/// `windows` otherwise.
+/// Builds the `CheckPlan` for one rule's `windows`/`unrestricted` pair.
 ///
-/// `unrestricted = false` alongside real `windows` is rejected rather than
-/// accepted as a no-op: its effect there (use `windows` normally) is
-/// identical to simply omitting the key, so writing it out explicitly is far
-/// more likely to be a misunderstanding worth catching than a deliberate
-/// no-op worth silently accepting. `unrestricted = false` with no `windows`
-/// at all isn't a redundant annotation on otherwise-valid config, though -
-/// it's the same "nothing configured" problem as omitting both keys, so it's
-/// reported as that instead. `windows` set alongside `unrestricted = true` is
-/// rejected too, since having both leaves it unclear which one the reader
-/// should trust.
+/// Exactly one of the two must be supplied: `windows` with `unrestricted`
+/// omitted entirely, or `unrestricted = true` with `windows` omitted.
 fn build_plan(
     index: usize, windows: Option<Vec<Window>>, unrestricted: Option<bool>,
 ) -> Result<CheckPlan, ConfigError> {

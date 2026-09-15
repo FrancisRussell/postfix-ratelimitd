@@ -5,7 +5,7 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{Client, ConnectionInfo, Script};
 use serde::Serialize;
 
-use crate::config::{CheckPlan, CheckPlanFields};
+use crate::config::CheckPlan;
 
 const CHECK_AND_RECORD: &str = include_str!("../lua/check_and_record.lua");
 
@@ -40,7 +40,7 @@ struct CheckRequest<'a> {
     // feature - see there for why this doesn't need its own gate here too.
     #[serde(skip_serializing_if = "Option::is_none")]
     now_override: Option<u64>,
-    plan: CheckPlanFields<'a>,
+    plan: &'a CheckPlan,
 }
 
 /// Identifies a key as a per-user rate-limit bucket hash, distinguishing it
@@ -162,7 +162,7 @@ impl Limiter {
             invocation.key(bucket_key(&self.key_prefix, sasl_username, bucket_size));
         }
 
-        let request = CheckRequest { recipient_count, now_override, plan: plan.fields() };
+        let request = CheckRequest { recipient_count, now_override, plan };
         let request =
             serde_json::to_string(&request).expect("CheckRequest contains no types that can fail to serialize");
         invocation.arg(request);
