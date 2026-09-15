@@ -26,43 +26,30 @@ const CONNECTION_RETRIES: usize = 3;
 const CONNECTION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 /// One `check_and_record.lua` invocation's arguments, sent as a single JSON
-/// value rather than flattened into positional arguments, so the two sides
-/// can't silently drift out of step on argument order or count.
+/// value.
 #[derive(Serialize)]
 struct CheckRequest<'a> {
     recipient_count: u32,
-    // Omitted entirely rather than sent as JSON `null` when absent: cjson
-    // decodes a JSON `null` to the sentinel `cjson.null`, not Lua's `nil` -
-    // which is truthy, so the script's `if request.now_override then` check would
-    // misfire on every request if this were serialized as `null` instead of
-    // left out. Only ever `Some` when the caller got it from
-    // `Request::now_override`, which doesn't exist outside the integration-tests
-    // feature - see there for why this doesn't need its own gate here too.
+    // Omitted entirely rather than sent as JSON `null` when absent since cjson
+    // decodes a JSON `null` to the sentinel `cjson.null` which is truthy.
     #[serde(skip_serializing_if = "Option::is_none")]
     now_override: Option<u64>,
     plan: &'a CheckPlan,
 }
 
-/// Identifies a key as a per-user rate-limit bucket hash, distinguishing it
-/// from any other kind of key that might one day share `key_prefix`.
+/// Identifies a key as a per-user rate-limit bucket hash.
 const BUCKET_KEY_TYPE: &str = "bucket";
 
-/// This key type's schema version - independent of any other key type's, so
-/// introducing or revising one doesn't force bumping (and so orphaning) keys
-/// of another. Bump this if a future change to `bucket_key`'s format or the
-/// meaning of a bucket hash's fields could otherwise make old-format data
-/// misread as valid under new code; a key-shape change alone doesn't need
-/// this, since it already can't collide with the shape it replaces.
+/// The bucket schema version. This should be bumped if the format or interpretation
+/// of the bucket data changes.
 const BUCKET_SCHEMA_VERSION: &str = "v1";
 
 /// The identity kind tagging every `sasl_username` bucketed by
-/// `Limiter::check` - see `identity`.
+/// `Limiter::check_sasl`.
 const SASL_IDENTITY_KIND: &str = "sasl";
 
 /// Escapes `\` and `:` in `value` so it can't be mistaken for anything else
-/// once embedded in an `identity` string. Borrows the input unchanged when
-/// nothing needs escaping, which is the common case, rather than always
-/// allocating a new `String`.
+/// once embedded in an `identity` string.
 fn escape_identity_value(value: &str) -> Cow<'_, str> {
     if value.contains(['\\', ':']) {
         Cow::Owned(value.replace('\\', "\\\\").replace(':', "\\:"))
@@ -73,19 +60,14 @@ fn escape_identity_value(value: &str) -> Cow<'_, str> {
 
 /// Formats `value` as a `bucket_key` identity, tagged with `kind` so a
 /// different kind sharing the same literal `value` can't collide onto the
-/// same key. `kind` must never itself contain `\` or `:` - true of every
-/// kind used in this crate. Escaping `value` means the result never
-/// contains a bare `:`, so `bucket_key` can safely append more after it.
+/// same key. `kind` must never itself contain `\` or `:`.
 fn identity(kind: &str, value: &str) -> String {
     debug_assert!(!kind.contains(['\\', ':']), "identity kind {kind:?} must not contain '\\' or ':'");
     format!("{kind}:{}", escape_identity_value(value))
 }
 
 /// The Redis key for one `bucket_size` slice of `identity`'s recorded
-/// counts. This is the only place a bucket key is assembled; `identity`
-/// (see `identity`) is already unambiguous, so appending `bucket_size`
-/// (always plain decimal digits) after it can't collide with a different
-/// `(identity, bucket_size)` pair.
+/// counts. This is the only place a bucket key is assembled.
 fn bucket_key(key_prefix: &str, identity: &str, bucket_size: u64) -> String {
     format!("{key_prefix}:{BUCKET_KEY_TYPE}:{BUCKET_SCHEMA_VERSION}:{identity}:{bucket_size}")
 }
@@ -96,10 +78,7 @@ fn bucket_key(key_prefix: &str, identity: &str, bucket_size: u64) -> String {
 /// `HGETALL`/`HINCRBY`/`HDEL`/`EXPIRE`/`TIME` calls.
 const REQUIRED_COMMANDS: &[&str] = &["EVALSHA", "SCRIPT", "HGETALL", "HINCRBY", "HDEL", "EXPIRE", "TIME"];
 
-/// Confirms the connected server recognizes every command in `commands`, so
-/// an incompatible server is refused loudly here - once per connection, at
-/// startup or reload (see `Limiter::new`, which passes [`REQUIRED_COMMANDS`])
-/// - rather than only surfacing as a script error on the first real check.
+/// Confirms the connected server recognizes every command in `commands`.
 pub async fn check_command_support(connection: &mut ConnectionManager, commands: &[&str]) -> redis::RedisResult<()> {
     let info: Vec<redis::Value> = redis::cmd("COMMAND").arg("INFO").arg(commands).query_async(connection).await?;
     let missing: Vec<&str> = commands
@@ -115,8 +94,7 @@ pub async fn check_command_support(connection: &mut ConnectionManager, commands:
     }
 }
 
-/// Checks and records recipient counts against Valkey via
-/// `check_and_record.lua`.
+/// Checks and records recipient counts against Valkey via `check_and_record.lua`.
 #[derive(Debug, Clone)]
 pub struct Limiter {
     connection_manager: ConnectionManager,
@@ -125,8 +103,7 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    /// Builds a `Limiter` from an already-resolved connection info (db and
-    /// password included).
+    /// Builds a `Limiter` from an already-resolved connection info (db and password included).
     pub async fn new(connection_info: ConnectionInfo, key_prefix: String) -> redis::RedisResult<Limiter> {
         let client = Client::open(connection_info)?;
         let manager_config = ConnectionManagerConfig::new()
@@ -139,24 +116,17 @@ impl Limiter {
         Ok(Limiter { connection_manager, key_prefix, script: Script::new(CHECK_AND_RECORD) })
     }
 
-    /// Records `recipient_count` only if every window in `plan` accepts it;
-    /// returns whether it was allowed.
+    /// Records `recipient_count` only if every window in `plan` accepts it; returns whether it was allowed.
     ///
-    /// Windows are aggregated into time buckets (see `check_and_record.lua`),
-    /// and windows whose durations land on the same bucket size share a key,
-    /// so a message updates each distinct key once, however many windows
-    /// reference it. `plan`'s bucket sizes and spans depend only on window
-    /// durations, never on a request, but re-serializing them alongside
-    /// `recipient_count` on every check is cheap enough not to be worth
-    /// caching separately. `now_override` should only ever be `Some` from a
-    /// request under the integration-tests feature - see
-    /// `Request::now_override`.
+    /// Windows are aggregated into time buckets and windows whose durations land on the same bucket size share a key,
+    /// so a message updates each distinct key once, however many windows reference it. `plan`'s bucket sizes and spans
+    /// depend only on window durations, never on a request. `now_override` should only ever be `Some` from a request
+    /// under the integration-tests feature.
     ///
-    /// An unrestricted rule's plan has no bucket sizes at all (nothing to
-    /// check, nothing to record), so this returns `Ok(true)` immediately
-    /// without touching Redis/Valkey.
+    /// An unrestricted rule's plan has no bucket sizes at all and so returns `Ok(true)` immediately without touching
+    /// Redis/Valkey.
     #[allow(clippy::missing_panics_doc)] // the only panic is an internal invariant, not a caller-facing condition
-    pub async fn check(
+    pub async fn check_sasl(
         &self, sasl_username: &str, recipient_count: u32, plan: &CheckPlan, now_override: Option<u64>,
     ) -> redis::RedisResult<bool> {
         if plan.bucket_sizes.is_empty() {
