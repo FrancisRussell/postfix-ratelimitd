@@ -320,7 +320,11 @@ impl Config {
             }
             let password =
                 std::fs::read_to_string(&path).map_err(|source| ConfigError::ReadPasswordFile { path, source })?;
-            redis_settings = redis_settings.set_password(password.trim_end());
+            // Only strips the file's own trailing line ending(s), e.g. from an editor's
+            // auto-appended final newline - never whitespace that could be part of the
+            // password itself, unlike a plain trim_end().
+            let password = password.trim_end_matches(['\n', '\r']);
+            redis_settings = redis_settings.set_password(password);
         }
         redis_connection_info = redis_connection_info.set_redis_settings(redis_settings);
 
@@ -731,6 +735,29 @@ mod tests {
         };
         let config = load(toml).expect("valid config with password file");
         assert_eq!(config.redis_connection_info.redis_settings().password(), Some("file-pw"));
+    }
+
+    #[test]
+    fn password_file_trailing_space_is_preserved() {
+        let password_file = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(password_file.path(), "file-pw \n").expect("write password file");
+        let path = password_file.path().display().to_string();
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            redis.password_file = path
+            server.socket = "/tmp/policy"
+
+            [[sasl]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
+        let config = load(toml).expect("valid config with password file");
+        assert_eq!(
+            config.redis_connection_info.redis_settings().password(),
+            Some("file-pw "),
+            "only the file's own trailing line ending should be stripped, not a real trailing space"
+        );
     }
 
     #[test]
