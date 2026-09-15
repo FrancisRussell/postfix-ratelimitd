@@ -4,8 +4,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -25,15 +25,10 @@ use tokio_util::task::TaskTracker;
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum LogTarget {
     /// Timestamped lines to stdout
-    // The default - unlike syslog, nothing here can assume a journald (or
-    // other) receiver is stamping each line for us. Safe for local runs,
-    // containers, and anywhere else not necessarily wired to a syslog socket.
     Stdout,
     /// RFC 3164 syslog via /dev/log
-    // Works under journald, which preserves priority and unit attribution
-    // for messages received this way the same as for native journal capture,
-    // or under a standalone rsyslog/syslog-ng - unlike a systemd-specific
-    // journal integration, this needs nothing systemd-specific to work.
+    // Also works under journald, which preserves priority and unit attribution for messages received this way the same
+    // as for native journal capture.
     Syslog,
 }
 
@@ -62,18 +57,12 @@ struct Cli {
     log_level: log::LevelFilter,
 }
 
-/// Protocol states this daemon accepts requests at, per its
-/// `smtpd_data_restrictions`/`smtpd_end_of_data_restrictions` wiring - both
-/// populate `recipient_count` with the message's final total, differing only
-/// in whether Postfix has already accepted the message body (END-OF-MESSAGE)
-/// or not yet (DATA - the cheaper of the two to reject at, since a client
-/// never uploads a body that was always going to be rejected).
+/// Protocol states this daemon accepts requests at, per its `smtpd_data_restrictions`/`smtpd_end_of_data_restrictions`
+/// wiring. Both populate `recipient_count` with the message's final total, differing only in whether Postfix has
+/// already accepted the message body (END-OF-MESSAGE) or not yet.
 const EXPECTED_PROTOCOL_STATES: [&str; 2] = ["DATA", "END-OF-MESSAGE"];
 
-/// Owner and group get read-write access, nobody else does - restricting who
-/// can reach the socket to whichever group the deploying systemd unit puts
-/// this daemon and Postfix in together (see
-/// contrib/postfix-ratelimitd.service).
+/// Owner and group get read-write access.
 const SOCKET_MODE: u32 = 0o660;
 const SOCKET_PROBE_PREFIX: &str = ".rl-check-";
 
@@ -100,14 +89,9 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the periodic stats line (see `report_stats`) is printed.
 const STATS_INTERVAL: Duration = Duration::from_mins(1);
 
-/// Counts of what's happened since the last periodic stats line - see
-/// `report_stats`, which resets every field to 0 each time it reports them.
-/// `active_connections` isn't here since it's a live gauge, not something to
-/// accumulate - `report_stats` reads `ACTIVE_CONNECTIONS` directly instead.
-/// `misconfigured` isn't printed either - a wrong `protocol_state` or missing
-/// `recipient_count` should never happen in a working deployment, so it exists
-/// only to gate `log_throttled` for those two, not as a rate worth reporting.
-#[derive(Debug)]
+/// Counts of what's happened since the last periodic stats line. `active_connections` isn't here since it's a live
+/// gauge.
+#[derive(Debug, Default)]
 struct Stats {
     accepted: AtomicU64,
     rejected: AtomicU64,
@@ -121,18 +105,7 @@ struct Stats {
     accept_errors: AtomicU64,
 }
 
-static STATS: Stats = Stats {
-    accepted: AtomicU64::new(0),
-    rejected: AtomicU64::new(0),
-    failed_deferred: AtomicU64::new(0),
-    failed_permitted: AtomicU64::new(0),
-    unauthenticated: AtomicU64::new(0),
-    malformed: AtomicU64::new(0),
-    misconfigured: AtomicU64::new(0),
-    connections_accepted: AtomicU64::new(0),
-    connections_rejected: AtomicU64::new(0),
-    accept_errors: AtomicU64::new(0),
-};
+static STATS: LazyLock<Stats> = LazyLock::new(Stats::default);
 
 /// Logs one line summarizing `STATS` and the current `ACTIVE_CONNECTIONS`,
 /// then resets `STATS` back to 0 for the next interval.
@@ -152,8 +125,8 @@ fn report_stats() {
         STATS.accept_errors.swap(0, Ordering::SeqCst),
         ACTIVE_CONNECTIONS.load(Ordering::SeqCst),
     );
-    // Not printed (see Stats::misconfigured) - reset here anyway so log_throttled's
-    // suppression window still lines up with this same interval.
+    // misconfigured isn't part of the printed line above. It's still reset
+    // here so its log_throttled suppression window lines up with this interval.
     STATS.misconfigured.store(0, Ordering::SeqCst);
 }
 
@@ -305,14 +278,10 @@ fn check_socket_directory(socket: &Path) -> std::io::Result<()> {
     std::fs::remove_file(&probe)
 }
 
-/// Acquires an exclusive, non-blocking lock on `socket`'s lock file - unlike
-/// `socket_is_live`'s check-then-act, this is atomic, closing (not just
-/// narrowing) the race between two instances of this daemon starting at
-/// once. Never explicitly released: a later instance can just reopen and
-/// relock the same path once this process's handle on it closes - unless
-/// something else unlinks it first, since the lock is tied to the open
-/// file, not the path, and a new instance would then relock a fresh inode
-/// without ever conflicting with this one.
+/// Acquires an exclusive, non-blocking lock on `socket`'s lock file. The
+/// lock is tied to the open file, not the path. It's never released
+/// explicitly. Closing this process's handle on it frees the lock
+/// automatically, letting a later instance safely relock the same path.
 fn acquire_startup_lock(socket: &Path) -> std::io::Result<std::fs::File> {
     let mut lock_path = socket.as_os_str().to_owned();
     lock_path.push(LOCK_FILE_SUFFIX);
@@ -321,17 +290,11 @@ fn acquire_startup_lock(socket: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Whether another process is already listening on `socket`, or this process
-/// can't tell either way. Connecting succeeds as soon as a listener exists
-/// (it doesn't need to `accept()` this specific connection first), so a
-/// successful connect is an unambiguous live signal. A permission error is
-/// inconclusive rather than a live signal in its own right, but is treated
-/// the same way (refuse to proceed) since removing and rebinding on an
-/// unverifiable guess risks silently orphaning a real listener. Every other
-/// failure, including the path not existing at all, means whatever's there
-/// (if anything) is safe to remove and rebind: a stale socket file left
-/// behind by a process that didn't exit cleanly refuses connections rather
-/// than accepting them.
+/// Whether another process is already listening on `socket`. A successful
+/// connect is a live signal; a permission error can't tell live from stale,
+/// so it's treated as live too rather than risk removing a real listener's
+/// socket on an unverifiable guess. Every other error means it's safe to
+/// remove and rebind.
 fn socket_is_live(socket: &Path) -> bool {
     match std::os::unix::net::UnixStream::connect(socket) {
         Ok(_) => true,
@@ -340,10 +303,7 @@ fn socket_is_live(socket: &Path) -> bool {
 }
 
 /// Logs `message` for an unrecoverable startup failure and returns the
-/// failure `ExitCode` for `main` to return - letting `main` return normally,
-/// rather than calling `std::process::exit`, so everything already
-/// constructed (the Redis connection, the bound listener) still runs its
-/// `Drop` glue, instead of the process being torn down out from under it.
+/// failure `ExitCode` for `main` to return.
 fn fatal(message: impl std::fmt::Display) -> ExitCode {
     log::error!("{message}");
     ExitCode::FAILURE
@@ -442,9 +402,7 @@ async fn reload_config(path: &Path, config: &ArcSwap<Config>, limiter: &ArcSwap<
     log::info!("reloaded config from {}", path.display());
 }
 
-/// Sets the process umask, returning the previous one - the only unsafe
-/// code in this crate, confined here so `#![deny(unsafe_code)]` above
-/// catches anything else added outside it.
+/// Sets the process umask, returning the previous one.
 ///
 /// SAFETY: `umask(2)` only reads and writes process-wide umask state - it
 /// can't invalidate anything else, regardless of what else is running
@@ -457,9 +415,7 @@ fn set_umask(mask: u32) -> u32 { unsafe { libc::umask(mask) } }
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Refuses to run at all unless explicitly acknowledged - see
-    // INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR. Before logging is set up, so
-    // this can only reach the user via stderr directly.
+    // Refuse to run at all if this is an integration test build unless explicitly acknowledged.
     #[cfg(feature = "integration-tests")]
     if std::env::var(postfix_ratelimitd::INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR).is_err() {
         eprintln!(
@@ -486,12 +442,9 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Declared before the listener and everything else server-related below,
-    // so it outlives all of them - held through this instance's full
-    // shutdown drain, not just this startup sequence. Acquired before
-    // connecting to Redis so a redundant instance fails immediately, rather
-    // than after paying for a connection attempt it was always going to
-    // throw away.
+    // Held for this instance's entire run, including its shutdown drain. It's
+    // acquired before connecting to Redis, so a redundant instance fails
+    // fast rather than paying for a connection it was always going to discard.
     let _startup_lock = match acquire_startup_lock(&config.socket) {
         Ok(lock) => lock,
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -595,7 +548,7 @@ async fn main() -> ExitCode {
                 // Spawned rather than awaited here, so a slow reconnect attempt against new
                 // redis settings can't stall accepting new connections. reload_in_progress caps
                 // concurrent reload attempts at one; a SIGHUP that arrives mid-reload isn't
-                // dropped, though - it bumps reload_requests, and the running worker notices
+                // dropped. Instead it bumps reload_requests, and the running worker notices
                 // that on its next pass and reloads again rather than exiting on a config that
                 // was already superseded while it worked.
                 reload_requests.fetch_add(1, Ordering::SeqCst);
