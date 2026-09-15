@@ -91,7 +91,9 @@ for i = 1, num_keys do
     local bucket = math.floor(now / bucket_size)
     redis.call("HINCRBY", KEYS[i], bucket, recipient_count)
     -- EXPIRE lets the key clean itself up via TTL if this sender goes quiet.
-    redis.call("EXPIRE", KEYS[i], plan.retention_secs[i])
+    -- +bucket_size covers the bucket just written above, which may have only
+    -- just started.
+    redis.call("EXPIRE", KEYS[i], plan.retention_secs[i] + bucket_size)
 
     local oldest = now - plan.retention_secs[i]
     local min_id = min_id_by_key[i]

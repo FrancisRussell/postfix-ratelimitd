@@ -734,6 +734,31 @@ fn expired_entries_stop_counting_against_the_limit() {
 }
 
 #[test]
+fn bucket_key_ttl_outlives_a_freshly_started_bucket() {
+    let valkey = ValkeyInstance::start_unix();
+    let window_span_secs: u64 = 3600;
+    let daemon = Daemon::start(&valkey, default_sasl_config(1, "3600s"));
+
+    let response = daemon.request("alice", 1);
+    assert_eq!(response, format!("action={ACTION_DUNNO}\n\n"));
+
+    let keys = valkey.keys("rl:bucket:v1:sasl:alice:*");
+    assert_eq!(keys.len(), 1, "expected exactly one key for the window");
+    let bucket_size: u64 =
+        keys[0].rsplit(':').next().expect("key has a bucket-size suffix").parse().expect("bucket size is numeric");
+
+    let mut connection = valkey.connection();
+    let ttl: i64 = redis::cmd("TTL").arg(&keys[0]).query(&mut connection).expect("ttl");
+
+    // The bucket just written may have only just started, so the TTL must
+    // reach at least one more bucket_size past the window span - otherwise a
+    // sender going quiet right after this request could see its newest
+    // bucket expire before any window still needing it actually could.
+    let min_ttl = i64::try_from(window_span_secs + bucket_size).expect("fits in i64") - 1;
+    assert!(ttl >= min_ttl, "ttl {ttl} should be at least {min_ttl} (window span + bucket size, -1 for rounding)");
+}
+
+#[test]
 fn a_week_long_window_expires_via_the_real_check_and_record_logic() {
     let valkey = ValkeyInstance::start_unix();
     let config = default_sasl_config(1, "7d");
