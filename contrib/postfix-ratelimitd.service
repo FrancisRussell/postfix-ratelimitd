@@ -54,6 +54,9 @@ RestrictNamespaces=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 UMask=0027
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
 
 [Install]
 WantedBy=multi-user.target
