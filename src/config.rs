@@ -193,6 +193,8 @@ struct RawServerConfig {
     /// Whether requests with no SASL username have warnings logged.
     #[serde(default = "default_warn_on_unauthenticated")]
     warn_on_unauthenticated: bool,
+    #[serde(default)]
+    control_socket: Option<PathBuf>,
 }
 
 /// The config file's shape, before `sasl` is validated and its regexes
@@ -214,6 +216,7 @@ pub struct Config {
     pub on_redis_error: FailureAction,
     pub warn_on_unauthenticated: bool,
     pub socket: PathBuf,
+    pub control_socket: Option<PathBuf>,
     pub sasl_limits: Vec<SaslLimitRule>,
     pub default_plan: CheckPlan,
 }
@@ -259,6 +262,8 @@ pub enum ConfigError {
     WindowTooShort { index: usize, duration: Duration },
     #[error("sasl[{index}] has a window duration of {duration:?}, but windows must be at most {MAX_WINDOW_DURATION:?}")]
     WindowTooLong { index: usize, duration: Duration },
+    #[error("server.control_socket must not be the same path as server.socket")]
+    ControlSocketSameAsSocket,
 }
 
 /// Rejects an empty `windows` list, or any window whose duration isn't a
@@ -297,6 +302,10 @@ fn build_plan(
         (None, Some(false) | None) => Err(ConfigError::NoWindows { index }),
     }
 }
+
+/// The config path both binaries default `--config` to, shared so the two
+/// can't drift out of sync on it.
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/postfix-ratelimitd/config.toml";
 
 impl Config {
     /// Reads, parses, and validates the config file at `path`.
@@ -356,12 +365,17 @@ impl Config {
             }
         }
 
+        if raw.server.control_socket.as_ref() == Some(&raw.server.socket) {
+            return Err(ConfigError::ControlSocketSameAsSocket);
+        }
+
         Ok(Config {
             redis_connection_info,
             redis_key_prefix: raw.redis.key_prefix,
             on_redis_error: raw.server.on_redis_error,
             warn_on_unauthenticated: raw.server.warn_on_unauthenticated,
             socket: raw.server.socket,
+            control_socket: raw.server.control_socket,
             sasl_limits,
             default_plan: default_plan.expect("default_count == 1 guarantees exactly one Default entry was seen"),
         })
@@ -772,6 +786,44 @@ mod tests {
         let toml = default_config(vec![window(1, "1h")]);
         let config = load(toml).expect("valid config");
         assert!(config.warn_on_unauthenticated);
+    }
+
+    #[test]
+    fn control_socket_defaults_to_none() {
+        let toml = default_config(vec![window(1, "1h")]);
+        let config = load(toml).expect("valid config");
+        assert_eq!(config.control_socket, None);
+    }
+
+    #[test]
+    fn control_socket_is_used_when_set() {
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+            server.control_socket = "/tmp/control"
+
+            [[sasl]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
+        let config = load(toml).expect("valid config");
+        assert_eq!(config.control_socket, Some(PathBuf::from("/tmp/control")));
+    }
+
+    #[test]
+    fn control_socket_same_as_socket_is_rejected() {
+        let toml = toml::toml! {
+            redis.url = "redis://127.0.0.1:6379"
+            redis.db = 1
+            server.socket = "/tmp/policy"
+            server.control_socket = "/tmp/policy"
+
+            [[sasl]]
+            type = "default"
+            windows = [ { count = 1, duration = "1h" } ]
+        };
+        assert!(matches!(load(toml), Err(ConfigError::ControlSocketSameAsSocket)));
     }
 
     #[test]

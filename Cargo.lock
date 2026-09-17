@@ -551,6 +551,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "json-rpc-types"
+version = "1.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39b0afa580009398a55539cbd8f7cebe94c1a12033cf3025d7d6a95c4bdef9b9"
+dependencies = [
+ "serde",
+ "str-buf",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -658,7 +668,9 @@ dependencies = [
  "arc-swap",
  "clap",
  "env_logger",
+ "humantime",
  "humantime-serde",
+ "json-rpc-types",
  "libc",
  "log",
  "redis",
@@ -996,6 +1008,15 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "str-buf"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ceb97b7225c713c2fd4db0153cb6b3cab244eb37900c3f634ed4d43310d8c34"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "subtle"

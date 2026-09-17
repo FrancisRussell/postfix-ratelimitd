@@ -10,5 +10,7 @@
   user-chosen time windows.
 * Rate-limiting based on literal and regex matches on SASL username along with fallback rule.
 * Postfix policy support via Unix domain socket endpoint.
+* Optional admin control socket for querying the policy daemon using the
+  `postfix-ratelimitctl` tool.
 * Integration tests against temporary Valkey instances.
 * Multiple connection support via Tokio async.

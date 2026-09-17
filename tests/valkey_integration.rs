@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use postfix_ratelimitd::config::BUCKET_TARGET_COUNT;
+use postfix_ratelimitd::control::{LIMITS_SASL_METHOD, RpcRequest, RpcResponse, StatusResponse};
 use postfix_ratelimitd::{
     ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE,
     INTEGRATION_TEST_ACKNOWLEDGMENT_ENV_VAR,
@@ -225,6 +226,8 @@ impl Drop for ValkeyInstance {
 struct Daemon {
     child: Child,
     socket: std::path::PathBuf,
+    /// `Some` only for a [`Daemon::start_with_control_socket`] instance.
+    control_socket: Option<std::path::PathBuf>,
     _dir: tempfile::TempDir,
 }
 
@@ -254,14 +257,31 @@ impl Daemon {
 
     /// As [`Daemon::start`], but with `env` set on the daemon's process - for
     /// e.g. pointing `SSL_CERT_FILE` at a throwaway CA.
-    fn start_with_env(valkey: &ValkeyInstance, mut extra_config: toml::Table, env: &[(&str, &str)]) -> Daemon {
+    fn start_with_env(valkey: &ValkeyInstance, extra_config: toml::Table, env: &[(&str, &str)]) -> Daemon {
+        Self::start_internal(valkey, extra_config, env, false)
+    }
+
+    /// As [`Daemon::start`], but also configures and binds an admin control
+    /// socket in the same tempdir, waiting for it to appear too before
+    /// returning.
+    fn start_with_control_socket(valkey: &ValkeyInstance, extra_config: toml::Table) -> Daemon {
+        Self::start_internal(valkey, extra_config, &[], true)
+    }
+
+    fn start_internal(
+        valkey: &ValkeyInstance, mut extra_config: toml::Table, env: &[(&str, &str)], with_control_socket: bool,
+    ) -> Daemon {
         let dir = tempfile::tempdir().expect("create temp dir");
         let socket = dir.path().join("policy.sock");
+        let control_socket = with_control_socket.then(|| dir.path().join("control.sock"));
         let config_path = dir.path().join("config.toml");
 
         set_default(&mut extra_config, "redis", "url", valkey.redis_url());
         set_default(&mut extra_config, "redis", "db", 0i64);
         set_default(&mut extra_config, "server", "socket", socket.display().to_string());
+        if let Some(control_socket) = &control_socket {
+            set_default(&mut extra_config, "server", "control_socket", control_socket.display().to_string());
+        }
         std::fs::write(&config_path, extra_config.to_string()).expect("write config");
 
         let child = Command::new(env!("CARGO_BIN_EXE_postfix-ratelimitd"))
@@ -280,8 +300,15 @@ impl Daemon {
             assert!(Instant::now() < deadline, "daemon did not create its socket in time");
             std::thread::sleep(POLL_INTERVAL);
         }
+        if let Some(control_socket) = &control_socket {
+            let deadline = Instant::now() + READY_TIMEOUT;
+            while !control_socket.exists() {
+                assert!(Instant::now() < deadline, "daemon did not create its control socket in time");
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
 
-        Daemon { child, socket, _dir: dir }
+        Daemon { child, socket, control_socket, _dir: dir }
     }
 
     /// Sends one raw policy request (not necessarily well-formed) and returns
@@ -322,6 +349,28 @@ impl Daemon {
              now_override={now_override}\n\n"
         ))
     }
+
+    /// Sends `request` as one JSON-RPC line to this daemon's control socket and returns its
+    /// parsed response.
+    fn control_request(&self, request: &RpcRequest) -> RpcResponse {
+        let control_socket = self.control_socket.as_ref().expect("Daemon has no control socket configured");
+        let stream = UnixStream::connect(control_socket).expect("connect to control socket");
+        let mut line = serde_json::to_vec(request).expect("request serializes");
+        line.push(b'\n');
+        (&stream).write_all(&line).expect("write request");
+        (&stream).flush().expect("flush request");
+
+        let mut reader = BufReader::new(&stream);
+        let mut response_line = String::new();
+        reader.read_line(&mut response_line).expect("read response line");
+        serde_json::from_str(&response_line).expect("valid JSON-RPC response")
+    }
+
+    /// As [`Daemon::control_request`], but building the one `limits.sasl` request this daemon
+    /// understands.
+    fn control_status(&self, username: &str) -> RpcResponse {
+        self.control_request(&postfix_ratelimitd::control::new_limits_sasl_request(username, 1))
+    }
 }
 
 impl Drop for Daemon {
@@ -353,6 +402,23 @@ fn default_sasl_config_multi(windows: Vec<toml::Value>) -> toml::Table {
 /// As [`default_sasl_config_multi`], with a single window.
 fn default_sasl_config(count: i64, duration: &str) -> toml::Table {
     default_sasl_config_multi(vec![window(count, duration)])
+}
+
+/// A `redis.key_prefix = "rl"` config with `username`'s own `unrestricted =
+/// true` rule ahead of a `type = "default"` rule with one window - lets a
+/// single daemon instance exercise both the unrestricted and the
+/// limited-and-counting branches of a control-socket status query.
+fn unrestricted_username_and_default_sasl_config(username: &str, count: i64, duration: &str) -> toml::Table {
+    toml::toml! {
+        redis.key_prefix = "rl"
+        [[sasl]]
+        type = "username"
+        username = username
+        unrestricted = true
+        [[sasl]]
+        type = "default"
+        windows = [ { count = count, duration = duration } ]
+    }
 }
 
 // The one test here that calls into the library directly rather than through
@@ -1313,4 +1379,259 @@ fn sequential_requests_stay_fast_across_many_concurrent_connections_with_full_wi
             });
         }
     });
+}
+
+#[test]
+fn control_socket_ping_returns_pong() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start_with_control_socket(
+        &valkey,
+        unrestricted_username_and_default_sasl_config("monitoring", 50, "1h"),
+    );
+
+    let response = daemon.control_request(&postfix_ratelimitd::control::new_ping_request(1));
+    let result = response.payload.expect("ping should succeed");
+    assert_eq!(result, serde_json::json!("pong"));
+}
+
+#[test]
+fn control_socket_status_reports_the_recorded_count_against_the_matched_window() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start_with_control_socket(
+        &valkey,
+        unrestricted_username_and_default_sasl_config("monitoring", 50, "1h"),
+    );
+
+    // Real time, not now_override: status always reads Valkey's live clock (see
+    // control::compute_sasl_status), so a simulated write time wouldn't necessarily still look
+    // fresh to it.
+    assert_eq!(daemon.request("alice", 5), format!("action={ACTION_DUNNO}\n\n"));
+    assert_eq!(daemon.request("alice", 7), format!("action={ACTION_DUNNO}\n\n"));
+
+    let response = daemon.control_status("alice");
+    let result = response.payload.expect("a well-formed status query should succeed");
+    let status: StatusResponse = serde_json::from_value(result).expect("result should be valid StatusResponse JSON");
+    let StatusResponse::Limited { windows, .. } = status else { panic!("expected a Limited response, got {status:?}") };
+    assert_eq!(windows.len(), 1, "the default rule has exactly one window");
+    assert_eq!(windows[0].span_secs, 3600);
+    assert_eq!(windows[0].limit, 50);
+    assert_eq!(windows[0].current_total, 12, "5 + 7 recipients recorded so far");
+}
+
+#[test]
+fn control_socket_status_reports_unrestricted_for_an_unrestricted_rule() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start_with_control_socket(
+        &valkey,
+        unrestricted_username_and_default_sasl_config("monitoring", 50, "1h"),
+    );
+
+    let response = daemon.control_status("monitoring");
+    let result = response.payload.expect("a well-formed status query should succeed");
+    let status: StatusResponse = serde_json::from_value(result).expect("result should be valid StatusResponse JSON");
+    assert!(
+        matches!(status, StatusResponse::Unrestricted { unrestricted: true }),
+        "expected an Unrestricted response, got {status:?}"
+    );
+}
+
+#[test]
+fn control_socket_rejects_an_unknown_method() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start_with_control_socket(
+        &valkey,
+        unrestricted_username_and_default_sasl_config("monitoring", 50, "1h"),
+    );
+
+    let response =
+        daemon.control_request(&postfix_ratelimitd::control::rpc::new_request("bogus", serde_json::Value::Null, 1));
+    let error = response.payload.expect_err("an unknown method should be rejected");
+    assert_eq!(
+        error.code,
+        postfix_ratelimitd::control::ErrorCode::MethodNotFound,
+        "expected the standard JSON-RPC \"method not found\" code"
+    );
+}
+
+#[test]
+fn control_socket_rejects_missing_params_as_invalid_params() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start_with_control_socket(
+        &valkey,
+        unrestricted_username_and_default_sasl_config("monitoring", 50, "1h"),
+    );
+
+    let response = daemon.control_request(&postfix_ratelimitd::control::rpc::new_request(
+        LIMITS_SASL_METHOD,
+        serde_json::json!({}),
+        1,
+    ));
+    let error = response.payload.expect_err("missing username should be rejected");
+    assert_eq!(
+        error.code,
+        postfix_ratelimitd::control::ErrorCode::InvalidParams,
+        "expected the standard JSON-RPC \"invalid params\" code"
+    );
+}
+
+#[test]
+fn control_socket_serves_multiple_sequential_requests_on_one_connection() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start_with_control_socket(
+        &valkey,
+        unrestricted_username_and_default_sasl_config("monitoring", 50, "1h"),
+    );
+    let control_socket = daemon.control_socket.as_ref().expect("control socket configured");
+    let stream = UnixStream::connect(control_socket).expect("connect to control socket");
+
+    let request = |username: &str| {
+        serde_json::to_string(&postfix_ratelimitd::control::new_limits_sasl_request(username, 1))
+            .expect("request serializes")
+    };
+    let mut reader = BufReader::new(&stream);
+    for username in ["alice", "bob", "monitoring"] {
+        (&stream).write_all(request(username).as_bytes()).expect("write request");
+        (&stream).write_all(b"\n").expect("write newline");
+        (&stream).flush().expect("flush request");
+        let mut response_line = String::new();
+        reader.read_line(&mut response_line).expect("read response line");
+        let response: RpcResponse = serde_json::from_str(&response_line).expect("valid JSON-RPC response");
+        assert!(response.payload.is_ok(), "request for {username:?} should succeed, got {response:?}");
+    }
+}
+
+/// Drives the actual compiled `postfix-ratelimitctl` binary as a subprocess, not just a
+/// hand-built request: a real client can write more than one value in a single write() call, and
+/// the connection handling must not desync when it does - a `redis-rs` client's own `CLIENT
+/// SETINFO` handshake pipelines its own connection setup this way.
+#[test]
+fn ratelimitctl_completes_against_a_running_daemon() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start_with_control_socket(
+        &valkey,
+        unrestricted_username_and_default_sasl_config("monitoring", 50, "1h"),
+    );
+    assert_eq!(daemon.request("alice", 5), format!("action={ACTION_DUNNO}\n\n"));
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("config.toml");
+    let mut config = unrestricted_username_and_default_sasl_config("monitoring", 50, "1h");
+    set_default(&mut config, "redis", "url", valkey.redis_url());
+    set_default(&mut config, "redis", "db", 0i64);
+    set_default(&mut config, "server", "socket", daemon.socket.display().to_string());
+    set_default(
+        &mut config,
+        "server",
+        "control_socket",
+        daemon.control_socket.as_ref().expect("control socket configured").display().to_string(),
+    );
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_postfix-ratelimitctl"))
+        .arg("--config")
+        .arg(&config_path)
+        .args(["limits", "sasl", "alice"])
+        .output()
+        .expect("run postfix-ratelimitctl");
+
+    assert!(
+        output.status.success(),
+        "status subcommand should exit successfully, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("alice"), "expected output to mention the queried username, got: {stdout}");
+    assert!(stdout.contains("50"), "expected output to mention the window's limit, got: {stdout}");
+}
+
+#[test]
+fn ratelimitctl_ping_completes_against_a_running_daemon() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start_with_control_socket(
+        &valkey,
+        unrestricted_username_and_default_sasl_config("monitoring", 50, "1h"),
+    );
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("config.toml");
+    let mut config = unrestricted_username_and_default_sasl_config("monitoring", 50, "1h");
+    set_default(&mut config, "redis", "url", valkey.redis_url());
+    set_default(&mut config, "redis", "db", 0i64);
+    set_default(&mut config, "server", "socket", daemon.socket.display().to_string());
+    set_default(
+        &mut config,
+        "server",
+        "control_socket",
+        daemon.control_socket.as_ref().expect("control socket configured").display().to_string(),
+    );
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_postfix-ratelimitctl"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("ping")
+        .output()
+        .expect("run postfix-ratelimitctl");
+
+    assert!(
+        output.status.success(),
+        "ping subcommand should exit successfully, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "control socket is up: pong");
+}
+
+#[test]
+fn ratelimitctl_raw_response_prints_the_wire_result_verbatim() {
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start_with_control_socket(
+        &valkey,
+        unrestricted_username_and_default_sasl_config("monitoring", 50, "1h"),
+    );
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("config.toml");
+    let mut config = unrestricted_username_and_default_sasl_config("monitoring", 50, "1h");
+    set_default(&mut config, "redis", "url", valkey.redis_url());
+    set_default(&mut config, "redis", "db", 0i64);
+    set_default(&mut config, "server", "socket", daemon.socket.display().to_string());
+    set_default(
+        &mut config,
+        "server",
+        "control_socket",
+        daemon.control_socket.as_ref().expect("control socket configured").display().to_string(),
+    );
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_postfix-ratelimitctl"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--raw-response")
+        .arg("ping")
+        .output()
+        .expect("run postfix-ratelimitctl");
+
+    assert!(
+        output.status.success(),
+        "ping --raw-response should exit successfully, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--raw-response output should be valid JSON");
+    assert_eq!(parsed, serde_json::json!("pong"));
+}
+
+#[test]
+fn control_socket_is_created_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let valkey = ValkeyInstance::start_unix();
+    let daemon = Daemon::start_with_control_socket(
+        &valkey,
+        unrestricted_username_and_default_sasl_config("monitoring", 50, "1h"),
+    );
+
+    let control_socket = daemon.control_socket.as_ref().expect("control socket configured");
+    let mode = std::fs::metadata(control_socket).expect("stat control socket").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the control socket must not be group- or other-accessible, unlike the policy socket");
 }

@@ -13,7 +13,9 @@ use clap::Parser;
 use postfix_ratelimitd::config::{Config, FailureAction};
 use postfix_ratelimitd::limiter::Limiter;
 use postfix_ratelimitd::protocol::{Request, write_action};
-use postfix_ratelimitd::{ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE};
+use postfix_ratelimitd::{
+    ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE, control,
+};
 use redis::ConnectionInfo;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
@@ -36,7 +38,7 @@ enum LogTarget {
 #[command(version, about)]
 struct Cli {
     /// Path to the daemon's TOML config file
-    #[arg(short, long, default_value = "/etc/postfix-ratelimitd/config.toml")]
+    #[arg(short, long, default_value = postfix_ratelimitd::config::DEFAULT_CONFIG_PATH)]
     config: PathBuf,
 
     /// Check the config file and socket directory for validity, then exit
@@ -64,6 +66,11 @@ const EXPECTED_PROTOCOL_STATES: [&str; 2] = ["DATA", "END-OF-MESSAGE"];
 
 /// Owner and group get read-write access.
 const SOCKET_MODE: u32 = 0o660;
+
+/// Owner-only - unlike `SOCKET_MODE`, the control socket must not be
+/// reachable via Postfix's membership in the runtime directory's group.
+const CONTROL_SOCKET_MODE: u32 = 0o600;
+
 const SOCKET_PROBE_PREFIX: &str = ".rl-check-";
 
 /// Suffix naming this instance's startup lock file (see
@@ -257,6 +264,25 @@ async fn handle_connection(
     }
 }
 
+/// Which listener a connection accepted from, so the caller can dispatch it
+/// to the matching handler after the two accept arms in the main loop's
+/// `select!` join back into one path.
+#[derive(Debug)]
+enum Accepted {
+    Policy(UnixStream),
+    Control(UnixStream),
+}
+
+/// Polls `listener`'s `accept()`, or never resolves if `listener` is `None` -
+/// so a `select!` arm built from this never fires while the control socket
+/// is disabled, without special-casing the loop itself.
+async fn accept_control(listener: Option<&UnixListener>) -> std::io::Result<UnixStream> {
+    match listener {
+        Some(listener) => listener.accept().await.map(|(stream, _addr)| stream),
+        None => std::future::pending().await,
+    }
+}
+
 /// Releases its connection's slot in `ACTIVE_CONNECTIONS`, even if the task
 /// panics.
 #[derive(Debug)]
@@ -307,6 +333,54 @@ fn socket_is_live(socket: &Path) -> bool {
 fn fatal(message: impl std::fmt::Display) -> ExitCode {
     log::error!("{message}");
     ExitCode::FAILURE
+}
+
+/// As [`acquire_startup_lock`], but already turned into the `ExitCode` `main` should return on
+/// failure - shared since both the policy and control sockets need their own instance of this
+/// exact same guard.
+fn acquire_startup_lock_or_fatal(socket: &Path) -> Result<std::fs::File, ExitCode> {
+    acquire_startup_lock(socket).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            fatal(format!("refusing to start: the startup lock for {} is already held", socket.display()))
+        } else {
+            fatal(format!("failed to acquire startup lock for {}: {err}", socket.display()))
+        }
+    })
+}
+
+/// Binds `socket` at `mode`, removing any stale (non-live) file at that path first. Shared
+/// between the policy and control sockets, which differ only in path and mode.
+fn bind_socket(socket: &Path, mode: u32) -> Result<UnixListener, ExitCode> {
+    if socket_is_live(socket) {
+        return Err(fatal(format!(
+            "refusing to start: {} is already in use by another process, or its permissions couldn't be verified",
+            socket.display()
+        )));
+    }
+    if let Err(err) = std::fs::remove_file(socket)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(fatal(format!("failed to remove stale socket {}: {err}", socket.display())));
+    }
+
+    // A freshly bound socket briefly exists at bind()'s own default mode until the chmod below
+    // narrows it to `mode` - narrowing the umask first (see SOCKET_CREATE_UMASK) makes that
+    // default owner-only regardless of the ambient umask, so the window is only ever more
+    // restrictive than `mode`, never less.
+    // umask is process-wide state, not scoped to this thread, so this would be unsound to leave
+    // narrowed around anything that creates files without an explicit mode of its own on another
+    // task - nothing between the two umask calls here does that, only the bind() itself.
+    let previous_umask = set_umask(SOCKET_CREATE_UMASK);
+    let listener = UnixListener::bind(socket);
+    set_umask(previous_umask);
+    let listener = match listener {
+        Ok(listener) => listener,
+        Err(err) => return Err(fatal(format!("failed to bind socket {}: {err}", socket.display()))),
+    };
+    if let Err(err) = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(mode)) {
+        return Err(fatal(format!("failed to set permissions on socket {}: {err}", socket.display())));
+    }
+    Ok(listener)
 }
 
 /// Installs the `log` backend `target` selects, filtered to `level`. Called
@@ -386,6 +460,11 @@ async fn reload_config(path: &Path, config: &ArcSwap<Config>, limiter: &ArcSwap<
         return;
     }
 
+    if new_config.control_socket != current.control_socket {
+        log::error!("not reloading config: `control_socket` changed, which requires a restart to take effect");
+        return;
+    }
+
     if !same_redis_connection(&new_config.redis_connection_info, &current.redis_connection_info)
         || new_config.redis_key_prefix != current.redis_key_prefix
     {
@@ -435,27 +514,30 @@ async fn main() -> ExitCode {
     };
 
     if cli.check_config {
-        if let Err(err) = check_socket_directory(&config.socket) {
-            return fatal(format!("socket directory check failed for {}: {err}", config.socket.display()));
+        for socket in [Some(&config.socket), config.control_socket.as_ref()].into_iter().flatten() {
+            if let Err(err) = check_socket_directory(socket) {
+                return fatal(format!("socket directory check failed for {}: {err}", socket.display()));
+            }
         }
         println!("config OK: {}", cli.config.display());
         return ExitCode::SUCCESS;
     }
 
-    // Held for this instance's entire run, including its shutdown drain. It's
-    // acquired before connecting to Redis, so a redundant instance fails
-    // fast rather than paying for a connection it was always going to discard.
-    let _startup_lock = match acquire_startup_lock(&config.socket) {
+    // Held for this instance's entire run, including its shutdown drain. It's acquired before
+    // connecting to Redis, so a redundant instance fails fast rather than paying for a
+    // connection it was always going to discard. A second lock guards `control_socket`
+    // separately, for the case where two different configs happen to name the same one -
+    // the first lock alone only catches two instances sharing `socket`.
+    let _startup_lock = match acquire_startup_lock_or_fatal(&config.socket) {
         Ok(lock) => lock,
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-            return fatal(format!(
-                "refusing to start: the startup lock for {} is already held",
-                config.socket.display()
-            ));
-        }
-        Err(err) => {
-            return fatal(format!("failed to acquire startup lock for {}: {err}", config.socket.display()));
-        }
+        Err(code) => return code,
+    };
+    let _control_startup_lock = match &config.control_socket {
+        Some(control_socket) => match acquire_startup_lock_or_fatal(control_socket) {
+            Ok(lock) => Some(lock),
+            Err(code) => return code,
+        },
+        None => None,
     };
 
     let limiter = match Limiter::new(config.redis_connection_info.clone(), config.redis_key_prefix.clone()).await {
@@ -463,43 +545,26 @@ async fn main() -> ExitCode {
         Err(err) => return fatal(format!("failed to initialize valkey client: {err}")),
     };
 
-    if socket_is_live(&config.socket) {
-        return fatal(format!(
-            "refusing to start: {} is already in use by another process, or its permissions couldn't be verified",
-            config.socket.display()
-        ));
-    }
-
-    if let Err(err) = std::fs::remove_file(&config.socket)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        return fatal(format!("failed to remove stale socket {}: {err}", config.socket.display()));
-    }
-
-    // A freshly bound socket briefly exists at bind()'s own default mode until
-    // the chmod below narrows it to SOCKET_MODE - narrowing the umask first
-    // (see SOCKET_CREATE_UMASK) makes that default owner-only regardless of
-    // the ambient umask, so the window is only ever more restrictive than
-    // SOCKET_MODE, never less.
-    // umask is process-wide state, not scoped to this thread, so this would be
-    // unsound to leave narrowed around anything that creates files without an
-    // explicit mode of its own on another task - nothing between the two
-    // umask calls here does that, only the bind() itself.
-    let previous_umask = set_umask(SOCKET_CREATE_UMASK);
-    let listener = UnixListener::bind(&config.socket);
-    set_umask(previous_umask);
-    let listener = match listener {
+    // Access control beyond this is the install-time socket directory's job, not this file's -
+    // SOCKET_MODE/CONTROL_SOCKET_MODE only need to be as tight as each socket's own intended
+    // audience requires (shared with Postfix's group, or owner-only), not to substitute for the
+    // directory's own restriction.
+    let listener = match bind_socket(&config.socket, SOCKET_MODE) {
         Ok(listener) => listener,
-        Err(err) => return fatal(format!("failed to bind socket {}: {err}", config.socket.display())),
+        Err(code) => return code,
     };
-    // Access control is the install-time socket directory's job, not this file's -
-    // SOCKET_MODE only needs to be as tight as sharing the socket with Postfix's
-    // group requires, not to substitute for the directory's own restriction.
-    if let Err(err) = std::fs::set_permissions(&config.socket, std::fs::Permissions::from_mode(SOCKET_MODE)) {
-        return fatal(format!("failed to set permissions on socket {}: {err}", config.socket.display()));
-    }
-
     log::info!("listening on {}", config.socket.display());
+
+    let control_listener = match &config.control_socket {
+        Some(control_socket) => match bind_socket(control_socket, CONTROL_SOCKET_MODE) {
+            Ok(listener) => {
+                log::info!("listening for control connections on {}", control_socket.display());
+                Some(listener)
+            }
+            Err(code) => return code,
+        },
+        None => None,
+    };
 
     tokio::spawn(async {
         let mut interval = tokio::time::interval(STATS_INTERVAL);
@@ -528,14 +593,22 @@ async fn main() -> ExitCode {
     let tracker = TaskTracker::new();
 
     loop {
-        let stream = tokio::select! {
+        let accepted = tokio::select! {
             result = listener.accept() => match result {
-                Ok((stream, _addr)) => stream,
+                Ok((stream, _addr)) => Accepted::Policy(stream),
                 Err(err) => {
                     log::warn!("failed to accept connection: {err}");
                     STATS.accept_errors.fetch_add(1, Ordering::SeqCst);
                     // Avoids busy-looping if accept() is persistently failing, e.g. out of file
                     // descriptors.
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    continue;
+                }
+            },
+            result = accept_control(control_listener.as_ref()) => match result {
+                Ok(stream) => Accepted::Control(stream),
+                Err(err) => {
+                    log::warn!("failed to accept control connection: {err}");
                     tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                     continue;
                 }
@@ -576,23 +649,44 @@ async fn main() -> ExitCode {
 
         if ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
-            // This has no backoff of its own, unlike the accept() failure path below, so a
-            // sustained overload would otherwise log once per connection attempt for as
-            // long as it lasts - see log_throttled.
-            log_throttled(&STATS.connections_rejected, "concurrent connection limit rejection", || {
-                log::warn!("rejecting connection: at the concurrent connection limit ({MAX_CONNECTIONS})");
-            });
+            // Both socket types share this one fd budget, but only a policy-socket rejection
+            // counts toward STATS.connections_rejected, matching connections_accepted below
+            // being policy-only - so connections_accepted + connections_rejected keeps meaning
+            // "all policy-socket accept outcomes", not diluted by admin traffic.
+            match &accepted {
+                Accepted::Policy(_) => {
+                    // This has no backoff of its own, unlike the accept() failure path below, so
+                    // a sustained overload would otherwise log once per connection attempt for
+                    // as long as it lasts - see log_throttled.
+                    log_throttled(&STATS.connections_rejected, "concurrent connection limit rejection", || {
+                        log::warn!("rejecting connection: at the concurrent connection limit ({MAX_CONNECTIONS})");
+                    });
+                }
+                Accepted::Control(_) => {
+                    log::warn!("rejecting control connection: at the concurrent connection limit ({MAX_CONNECTIONS})");
+                }
+            }
             continue;
         }
-        STATS.connections_accepted.fetch_add(1, Ordering::SeqCst);
 
         let config = Arc::clone(&config);
         let limiter = Arc::clone(&limiter);
         let cancel = cancel.clone();
-        tracker.spawn(async move {
-            let _guard = ConnectionGuard;
-            handle_connection(stream, config, limiter, cancel).await;
-        });
+        match accepted {
+            Accepted::Policy(stream) => {
+                STATS.connections_accepted.fetch_add(1, Ordering::SeqCst);
+                tracker.spawn(async move {
+                    let _guard = ConnectionGuard;
+                    handle_connection(stream, config, limiter, cancel).await;
+                });
+            }
+            Accepted::Control(stream) => {
+                tracker.spawn(async move {
+                    let _guard = ConnectionGuard;
+                    control::handle_connection(stream, config, limiter, cancel).await;
+                });
+            }
+        }
     }
 
     cancel.cancel();

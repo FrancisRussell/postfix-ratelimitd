@@ -20,7 +20,9 @@ User=postfix-ratelimitd
 
 # Matches the default `server.socket` in contrib/config.toml. Postfix
 # will need to be added to the postfix-ratelimitd group and not run
-# inside a chroot to access /run/postfix-ratelimitd/ratelimit.sock.
+# inside a chroot to access /run/postfix-ratelimitd/ratelimit.sock. If
+# `server.control_socket` is enabled, it also lives here with 0600
+# (owner-only) permissions.
 RuntimeDirectory=postfix-ratelimitd
 RuntimeDirectoryMode=0750
 

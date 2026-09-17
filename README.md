@@ -62,6 +62,12 @@ on_redis_error = "defer"
 # logging of it.
 warn_on_unauthenticated = true
 
+# Optional second unix socket for admin queries with the `postfix-ratelimitctl`
+# tool, disabled unless set. Unlike the policy socket above, Postfix must never
+# reach this socket, so it's created with 0600 (owner-only) permissions. Like
+# the policy socket, changing it requires a restart, not just SIGHUP.
+# control_socket = "/run/postfix-ratelimitd/control.sock"
+
 # Rules matching against the SASL username, evaluated top-to-bottom; the
 # first match wins. Exactly one `type = "default"` rule must be present, as
 # the fallback when nothing else matches. Each window's duration must be a
@@ -104,8 +110,8 @@ same server. `redis.key_prefix` is then purely for human-readability when
 inspecting the keyspace directly, not for isolation.
 
 Sending the running daemon `SIGHUP` reloads the config file, including
-reconnecting to a changed `[redis]` backend. `server.socket` can't be changed
-this way - that requires a restart.
+reconnecting to a changed `[redis]` backend. `server.socket` and
+`server.control_socket` can only be changed by a full restart.
 
 ## Postfix wiring
 
@@ -149,6 +155,9 @@ or permit depending on the value of `on_redis_error`.
 postfix-ratelimitd --config /etc/postfix-ratelimitd/config.toml
 ```
 
+Querying a running daemon's admin control socket is a separate tool,
+`postfix-ratelimitctl` - see [Admin control socket](#admin-control-socket).
+
 | Flag | Description |
 | --- | --- |
 | `-c`, `--config <PATH>` | Path to the TOML config file (default `/etc/postfix-ratelimitd/config.toml`) |
@@ -164,6 +173,39 @@ created in the configured socket's directory (without touching the
 configured socket path itself). A config referencing paths that don't exist
 yet on the machine running the check will fail `-t` until those paths are in
 place.
+
+## Admin control socket
+
+Setting `server.control_socket` opens a second unix socket (disabled unless
+configured) for querying the running daemon. `postfix-ratelimitctl` can be
+used to issue queries to this socket:
+
+```
+$ postfix-ratelimitctl --config /etc/postfix-ratelimitd/config.toml limits sasl alice
+alice: status as of 2026-01-16T12:00:00Z
+  1h window: 12/50 (24.0%)
+  1day window: 40/200 (20.0%)
+```
+
+`postfix-ratelimitctl ping` checks that the control socket itself is up and
+responding, without touching Valkey.
+
+Any command also accepts `--raw-response`, which prints the JSON-RPC
+`result` value as-is instead of formatted output:
+
+```
+$ postfix-ratelimitctl --raw-response limits sasl alice
+{
+  "computed_at": 1768564800,
+  "windows": [
+    { "span_secs": 3600, "limit": 50, "current_total": 12 },
+    { "span_secs": 86400, "limit": 200, "current_total": 40 }
+  ]
+}
+```
+
+Note that this is the wire protocol, not a stable interface, so its shape can change
+between versions.
 
 ## Logging
 

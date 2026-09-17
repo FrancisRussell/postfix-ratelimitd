@@ -49,6 +49,12 @@ on_redis_error = "defer"
 # logging of it.
 warn_on_unauthenticated = true
 
+# Optional second unix socket for admin queries with the `postfix-ratelimitctl`
+# tool, disabled unless set. Unlike the policy socket above, Postfix must never
+# reach this socket, so it's created with 0600 (owner-only) permissions. Like
+# the policy socket, changing it requires a restart, not just SIGHUP.
+# control_socket = "/run/postfix-ratelimitd/control.sock"
+
 # Rules matching against the SASL username, evaluated top-to-bottom; the
 # first match wins. Exactly one `type = "default"` rule must be present, as
 # the fallback when nothing else matches. Each window's duration must be a

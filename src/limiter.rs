@@ -46,7 +46,7 @@ const BUCKET_SCHEMA_VERSION: &str = "v1";
 
 /// The identity kind tagging every `sasl_username` bucketed by
 /// `Limiter::check_sasl`.
-const SASL_IDENTITY_KIND: &str = "sasl";
+pub(crate) const SASL_IDENTITY_KIND: &str = "sasl";
 
 /// Escapes `\` and `:` in `value` so it can't be mistaken for anything else
 /// once embedded in an `identity` string.
@@ -61,14 +61,14 @@ fn escape_identity_value(value: &str) -> Cow<'_, str> {
 /// Formats `value` as a `bucket_key` identity, tagged with `kind` so a
 /// different kind sharing the same literal `value` can't collide onto the
 /// same key. `kind` must never itself contain `\` or `:`.
-fn identity(kind: &str, value: &str) -> String {
+pub(crate) fn identity(kind: &str, value: &str) -> String {
     debug_assert!(!kind.contains(['\\', ':']), "identity kind {kind:?} must not contain '\\' or ':'");
     format!("{kind}:{}", escape_identity_value(value))
 }
 
 /// The Redis key for one `bucket_size` slice of `identity`'s recorded
 /// counts. This is the only place a bucket key is assembled.
-fn bucket_key(key_prefix: &str, identity: &str, bucket_size: u64) -> String {
+pub(crate) fn bucket_key(key_prefix: &str, identity: &str, bucket_size: u64) -> String {
     format!("{key_prefix}:{BUCKET_KEY_TYPE}:{BUCKET_SCHEMA_VERSION}:{identity}:{bucket_size}")
 }
 
@@ -115,6 +115,14 @@ impl Limiter {
         check_command_support(&mut connection_manager, REQUIRED_COMMANDS).await?;
         Ok(Limiter { connection_manager, key_prefix, script: Script::new(CHECK_AND_RECORD) })
     }
+
+    /// A clone of this `Limiter`'s connection, for a caller that needs to
+    /// issue its own commands against the same Valkey instance rather than
+    /// through `check_sasl`'s script invocation.
+    pub(crate) fn connection_manager(&self) -> ConnectionManager { self.connection_manager.clone() }
+
+    /// The key prefix this `Limiter`'s bucket keys are namespaced under.
+    pub(crate) fn key_prefix(&self) -> &str { &self.key_prefix }
 
     /// Records `recipient_count` only if every window in `plan` accepts it; returns whether it was allowed.
     ///
