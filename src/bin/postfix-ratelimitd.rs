@@ -173,11 +173,9 @@ async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -
     }
 
     let Some(sasl_username) = request.sasl_username() else {
-        // Always permitted - there's no identity to rate-limit against - but logged
-        // (unless silenced via warn_on_unauthenticated) since it usually means this
-        // is wired somewhere it shouldn't be. The counter always increments either
-        // way, so the periodic stats line stays accurate even with warnings
-        // silenced or throttled.
+        // Unauthenticated messages are always permitted but logged (unless silenced via warn_on_unauthenticated) since
+        // it usually means this is wired somewhere it shouldn't be. The counter always increments either way, so the
+        // periodic stats line stays accurate even with warnings silenced or throttled.
         if config.warn_on_unauthenticated {
             log_throttled(&STATS.unauthenticated, "unauthenticated request", || {
                 log::warn!("policy request has no SASL username - check this is wired to an authenticated service");

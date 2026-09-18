@@ -16,8 +16,7 @@ use serde_json::Value as JsonValue;
 pub type ErrorData = ();
 
 /// The method-name type: a fixed 32-byte inline buffer, avoiding a heap allocation for a short,
-/// statically-known name like [`super::LIMITS_SASL_METHOD`]. Reached via `json_rpc_types`'s own
-/// re-export of `str-buf` rather than adding `str-buf` as a separate direct dependency.
+/// statically-known name like [`super::LIMITS_SASL_METHOD`].
 pub type MethodName = json_rpc_types::str_buf::StrBuf<32>;
 
 pub type RpcError = json_rpc_types::Error<ErrorData, String>;
