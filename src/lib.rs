@@ -6,6 +6,7 @@ pub mod config;
 pub mod control;
 pub mod limiter;
 pub mod protocol;
+pub mod state;
 
 /// Policy response text shared between the daemon binary and its integration
 /// tests.

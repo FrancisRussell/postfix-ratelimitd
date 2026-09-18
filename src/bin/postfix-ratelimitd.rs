@@ -13,6 +13,7 @@ use clap::Parser;
 use postfix_ratelimitd::config::{Config, FailureAction};
 use postfix_ratelimitd::limiter::Limiter;
 use postfix_ratelimitd::protocol::{Request, write_action};
+use postfix_ratelimitd::state::RuntimeState;
 use postfix_ratelimitd::{
     ACTION_DUNNO, ACTION_MISCONFIGURED, ACTION_RATE_LIMITED, ACTION_SERVICE_UNAVAILABLE, control,
 };
@@ -231,9 +232,7 @@ async fn handle_request(request: &Request, config: &Config, limiter: &Limiter) -
 /// after a request completes. So shutdown only races `cancel` against the
 /// idle wait for the next request, not against a request already being
 /// handled - that always runs to completion.
-async fn handle_connection(
-    stream: UnixStream, config: Arc<ArcSwap<Config>>, limiter: Arc<ArcSwap<Limiter>>, cancel: CancellationToken,
-) {
+async fn handle_connection(stream: UnixStream, state: Arc<ArcSwap<RuntimeState>>, cancel: CancellationToken) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     loop {
@@ -252,9 +251,8 @@ async fn handle_connection(
         };
         // Loaded fresh per request so a config/limiter reload takes effect on a
         // connection Postfix keeps open across many requests.
-        let current_config = config.load_full();
-        let current_limiter = limiter.load_full();
-        let action = handle_request(&request, &current_config, &current_limiter).await;
+        let current = state.load_full();
+        let action = handle_request(&request, &current.config, &current.limiter).await;
         if let Err(err) = write_action(&mut writer, action).await {
             log::warn!("error writing policy response: {err}");
             return;
@@ -434,17 +432,19 @@ fn same_redis_connection(a: &ConnectionInfo, b: &ConnectionInfo) -> bool {
         && a_redis.protocol() == b_redis.protocol()
 }
 
-/// Handles one SIGHUP: reloads `path` and swaps it into `config`/`limiter` if
-/// safe, or logs why not and leaves the daemon running unchanged.
+/// Handles one SIGHUP: reloads `path` and swaps it into `state` if safe, or
+/// logs why not and leaves the daemon running unchanged.
 ///
 /// `server.socket` is fixed at startup - it's the already-bound listener, and
 /// nothing short of a restart can rebind it. A changed redis connection or
 /// key prefix instead triggers rebuilding `Limiter` against the new settings;
 /// that only succeeds if the new one actually connects, and if it doesn't,
-/// the whole reload is rejected (nothing swaps) so `config` can never
-/// disagree with the `Limiter` actually in use.
-async fn reload_config(path: &Path, config: &ArcSwap<Config>, limiter: &ArcSwap<Limiter>) {
-    let current = config.load_full();
+/// the whole reload is rejected (nothing swaps). Either way, `state` is
+/// replaced with one `store()` carrying both the new config and its matching
+/// limiter together, so a reader can never observe one paired with a stale
+/// version of the other.
+async fn reload_config(path: &Path, state: &ArcSwap<RuntimeState>) {
+    let current = state.load_full();
     let new_config = match Config::load(path) {
         Ok(config) => config,
         Err(err) => {
@@ -453,29 +453,32 @@ async fn reload_config(path: &Path, config: &ArcSwap<Config>, limiter: &ArcSwap<
         }
     };
 
-    if new_config.socket != current.socket {
+    if new_config.socket != current.config.socket {
         log::error!("not reloading config: `socket` changed, which requires a restart to take effect");
         return;
     }
 
-    if new_config.control_socket != current.control_socket {
+    if new_config.control_socket != current.config.control_socket {
         log::error!("not reloading config: `control_socket` changed, which requires a restart to take effect");
         return;
     }
 
-    if !same_redis_connection(&new_config.redis_connection_info, &current.redis_connection_info)
-        || new_config.redis_key_prefix != current.redis_key_prefix
-    {
-        match Limiter::new(new_config.redis_connection_info.clone(), new_config.redis_key_prefix.clone()).await {
-            Ok(new_limiter) => limiter.store(Arc::new(new_limiter)),
-            Err(err) => {
-                log::error!("not reloading config: failed to connect with the new redis settings: {err}");
-                return;
+    let new_limiter =
+        if !same_redis_connection(&new_config.redis_connection_info, &current.config.redis_connection_info)
+            || new_config.redis_key_prefix != current.config.redis_key_prefix
+        {
+            match Limiter::new(new_config.redis_connection_info.clone(), new_config.redis_key_prefix.clone()).await {
+                Ok(new_limiter) => new_limiter,
+                Err(err) => {
+                    log::error!("not reloading config: failed to connect with the new redis settings: {err}");
+                    return;
+                }
             }
-        }
-    }
+        } else {
+            current.limiter.clone()
+        };
 
-    config.store(Arc::new(new_config));
+    state.store(Arc::new(RuntimeState { config: new_config, limiter: new_limiter }));
     log::info!("reloaded config from {}", path.display());
 }
 
@@ -573,8 +576,7 @@ async fn main() -> ExitCode {
         }
     });
 
-    let config = Arc::new(ArcSwap::from_pointee(config));
-    let limiter = Arc::new(ArcSwap::from_pointee(limiter));
+    let state = Arc::new(ArcSwap::from_pointee(RuntimeState { config, limiter }));
     let reload_in_progress = Arc::new(AtomicBool::new(false));
     let reload_requests = Arc::new(AtomicU64::new(0));
     let mut terminate_signal = match signal(SignalKind::terminate()) {
@@ -625,14 +627,13 @@ async fn main() -> ExitCode {
                 reload_requests.fetch_add(1, Ordering::SeqCst);
                 if !reload_in_progress.swap(true, Ordering::SeqCst) {
                     let path = cli.config.clone();
-                    let config = Arc::clone(&config);
-                    let limiter = Arc::clone(&limiter);
+                    let state = Arc::clone(&state);
                     let reload_in_progress = Arc::clone(&reload_in_progress);
                     let reload_requests = Arc::clone(&reload_requests);
                     tokio::spawn(async move {
                         loop {
                             let generation = reload_requests.load(Ordering::SeqCst);
-                            reload_config(&path, &config, &limiter).await;
+                            reload_config(&path, &state).await;
                             if reload_requests.load(Ordering::SeqCst) == generation {
                                 break;
                             }
@@ -667,21 +668,20 @@ async fn main() -> ExitCode {
             continue;
         }
 
-        let config = Arc::clone(&config);
-        let limiter = Arc::clone(&limiter);
+        let state = Arc::clone(&state);
         let cancel = cancel.clone();
         match accepted {
             Accepted::Policy(stream) => {
                 STATS.connections_accepted.fetch_add(1, Ordering::SeqCst);
                 tracker.spawn(async move {
                     let _guard = ConnectionGuard;
-                    handle_connection(stream, config, limiter, cancel).await;
+                    handle_connection(stream, state, cancel).await;
                 });
             }
             Accepted::Control(stream) => {
                 tracker.spawn(async move {
                     let _guard = ConnectionGuard;
-                    control::handle_connection(stream, config, limiter, cancel).await;
+                    control::handle_connection(stream, state, cancel).await;
                 });
             }
         }

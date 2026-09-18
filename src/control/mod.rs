@@ -21,8 +21,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{CheckPlan, Config};
-use crate::limiter::{self, Limiter};
+use crate::config::CheckPlan;
+use crate::limiter;
+use crate::state::RuntimeState;
 
 /// Hard cap on one request line's length, so a malformed or hostile client can't grow the read
 /// buffer unbounded.
@@ -130,7 +131,7 @@ async fn compute_sasl_status(
 /// Dispatches one already-deserialized request to a response, never failing outright - every
 /// error becomes an `rpc::failure` rather than an `Err`, since a malformed request still gets a
 /// reply, just one describing the problem.
-async fn dispatch(request: RpcRequest, config: &ArcSwap<Config>, limiter: &ArcSwap<Limiter>) -> RpcResponse {
+async fn dispatch(request: RpcRequest, state: &ArcSwap<RuntimeState>) -> RpcResponse {
     match request.method.as_str() {
         PING_METHOD => rpc::success(request.id, JsonValue::String("pong".to_string())),
         LIMITS_SASL_METHOD => {
@@ -140,11 +141,10 @@ async fn dispatch(request: RpcRequest, config: &ArcSwap<Config>, limiter: &ArcSw
                     return rpc::failure(request.id, ErrorCode::InvalidParams, &format!("invalid params: {err}"));
                 }
             };
-            let current_config = config.load_full();
-            let current_limiter = limiter.load_full();
-            let plan = current_config.plan_for(&params.username);
-            let mut connection_manager = current_limiter.connection_manager();
-            match compute_sasl_status(&mut connection_manager, current_limiter.key_prefix(), plan, &params.username)
+            let current = state.load_full();
+            let plan = current.config.plan_for(&params.username);
+            let mut connection_manager = current.limiter.connection_manager();
+            match compute_sasl_status(&mut connection_manager, current.limiter.key_prefix(), plan, &params.username)
                 .await
             {
                 Ok(status) => rpc::success(
@@ -162,7 +162,7 @@ async fn dispatch(request: RpcRequest, config: &ArcSwap<Config>, limiter: &ArcSw
 }
 
 /// Parses and dispatches one request line into a response.
-async fn handle_line(line: &str, config: &ArcSwap<Config>, limiter: &ArcSwap<Limiter>) -> RpcResponse {
+async fn handle_line(line: &str, state: &ArcSwap<RuntimeState>) -> RpcResponse {
     // Two stages, matching the spec's distinction between the two: invalid JSON is a parse
     // error, while valid JSON that isn't a well-formed Request object (missing/wrong-typed
     // jsonrpc/method) is an invalid request. A jsonrpc version other than "2.0" is rejected this
@@ -173,7 +173,7 @@ async fn handle_line(line: &str, config: &ArcSwap<Config>, limiter: &ArcSwap<Lim
         Err(err) => rpc::failure(None, ErrorCode::ParseError, &format!("invalid JSON: {err}")),
         Ok(value) => match serde_json::from_value::<RpcRequest>(value) {
             Err(err) => rpc::failure(None, ErrorCode::InvalidRequest, &format!("invalid request: {err}")),
-            Ok(request) => dispatch(request, config, limiter).await,
+            Ok(request) => dispatch(request, state).await,
         },
     }
 }
@@ -181,9 +181,7 @@ async fn handle_line(line: &str, config: &ArcSwap<Config>, limiter: &ArcSwap<Lim
 /// Handles one control-socket connection: reads request lines until the connection closes or
 /// `cancel` fires, replying to each with one response line. An oversized or EOF-truncated line
 /// gets one best-effort error reply and the connection is then closed.
-pub async fn handle_connection(
-    stream: UnixStream, config: Arc<ArcSwap<Config>>, limiter: Arc<ArcSwap<Limiter>>, cancel: CancellationToken,
-) {
+pub async fn handle_connection(stream: UnixStream, state: Arc<ArcSwap<RuntimeState>>, cancel: CancellationToken) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     loop {
@@ -215,7 +213,7 @@ pub async fn handle_connection(
             return;
         }
 
-        let response = handle_line(line.trim_end_matches(['\n', '\r']), &config, &limiter).await;
+        let response = handle_line(line.trim_end_matches(['\n', '\r']), &state).await;
         if write_response(&mut writer, &response).await.is_err() {
             return;
         }
