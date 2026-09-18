@@ -5,6 +5,10 @@ use redis::{ConnectionInfo, IntoConnectionInfo};
 use regex_lite::Regex;
 use serde::{Deserialize, Serialize};
 
+/// The config path both binaries default `--config` to, shared so the two
+/// can't drift out of sync on it.
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/postfix-ratelimitd/config.toml";
+
 /// One recipient-count cap over a sliding time window.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Window {
@@ -302,10 +306,6 @@ fn build_plan(
         (None, Some(false) | None) => Err(ConfigError::NoWindows { index }),
     }
 }
-
-/// The config path both binaries default `--config` to, shared so the two
-/// can't drift out of sync on it.
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/postfix-ratelimitd/config.toml";
 
 impl Config {
     /// Reads, parses, and validates the config file at `path`.
