@@ -182,9 +182,9 @@ used to issue queries to this socket:
 
 ```
 $ postfix-ratelimitctl --config /etc/postfix-ratelimitd/config.toml limits sasl alice
-alice: status as of 2026-01-16T12:00:00Z
-  1h window: 12/50 (24.0%)
-  1day window: 40/200 (20.0%)
+alice: windows as of 2026-01-16T12:00:00Z
+  1h: 12/50 (24.0%)
+  1day: 40/200 (20.0%)
 ```
 
 `postfix-ratelimitctl ping` checks that the control socket itself is up and

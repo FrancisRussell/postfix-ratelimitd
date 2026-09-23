@@ -175,15 +175,15 @@ fn print_status(username: &str, status: &control::StatusResponse) {
         control::StatusResponse::Unrestricted { .. } => println!("{username}: unrestricted (no rate limit)"),
         control::StatusResponse::Limited { computed_at, windows } => {
             let computed_at = std::time::UNIX_EPOCH + Duration::from_secs(*computed_at);
-            println!("{username}: status as of {}", humantime::format_rfc3339_seconds(computed_at));
+            println!("{username}: windows as of {}", humantime::format_rfc3339_seconds(computed_at));
             for window in windows {
                 let span = humantime::format_duration(Duration::from_secs(window.span_secs));
                 if window.limit == 0 {
-                    println!("  {span} window: {}/0", window.current_total);
+                    println!("  {span}: {}/0", window.current_total);
                     continue;
                 }
                 let percent = 100.0 * f64::from(window.current_total) / f64::from(window.limit);
-                println!("  {span} window: {}/{} ({percent:.1}%)", window.current_total, window.limit);
+                println!("  {span}: {}/{} ({percent:.1}%)", window.current_total, window.limit);
             }
         }
     }
